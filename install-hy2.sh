@@ -25,7 +25,7 @@ if [[ ! -t 0 ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 OFFICIAL_INSTALLER="https://get.hy2.sh/"
@@ -319,66 +319,174 @@ meta_get() {
   fi
 }
 
-### 证书 ###
-# 官方 systemd 以 User=hysteria 运行，配置/证书必须对该用户可读
+### 证书 / 权限（官方服务以 User=hysteria 运行，必须可读配置）###
 get_hy_user() {
+  # 优先系统用户 hysteria（官方安装器默认）
+  if id hysteria >/dev/null 2>&1; then
+    echo "hysteria"
+    return 0
+  fi
   local u=""
   if [[ -f /etc/systemd/system/hysteria-server.service ]]; then
-    u="$(grep -E '^User=' /etc/systemd/system/hysteria-server.service 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+    u="$(grep -E '^User=' /etc/systemd/system/hysteria-server.service 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]' || true)"
   fi
-  if [[ -z "$u" ]] && id hysteria >/dev/null 2>&1; then
-    u="hysteria"
+  if [[ -n "$u" ]] && id "$u" >/dev/null 2>&1; then
+    echo "$u"
+    return 0
   fi
-  echo "${u:-root}"
+  echo "root"
 }
 
+# 把证书挪到 /etc/hysteria，避免 /root 700 导致 hysteria 读不到
+relocate_certs_if_needed() {
+  local changed=0
+  if [[ -n "${CERT_PATH:-}" && -f "${CERT_PATH}" ]]; then
+    case "$CERT_PATH" in
+      "${HY_DIR}"/*) ;;
+      *)
+        mkdir -p "$HY_DIR"
+        cp -f "$CERT_PATH" "${HY_DIR}/cert.crt"
+        CERT_PATH="${HY_DIR}/cert.crt"
+        changed=1
+        ;;
+    esac
+  fi
+  if [[ -n "${KEY_PATH:-}" && -f "${KEY_PATH}" ]]; then
+    case "$KEY_PATH" in
+      "${HY_DIR}"/*) ;;
+      *)
+        mkdir -p "$HY_DIR"
+        cp -f "$KEY_PATH" "${HY_DIR}/private.key"
+        KEY_PATH="${HY_DIR}/private.key"
+        changed=1
+        ;;
+    esac
+  fi
+  # 若 config 已存在且仍写着 /root 路径，改成 /etc/hysteria
+  if [[ -f "$HY_CONF" ]] && grep -qE '/root/|/home/' "$HY_CONF" 2>/dev/null; then
+    sed -i.bak \
+      -e "s|^  cert:.*|  cert: ${HY_DIR}/cert.crt|" \
+      -e "s|^  key:.*|  key: ${HY_DIR}/private.key|" \
+      "$HY_CONF" 2>/dev/null || true
+    rm -f "${HY_CONF}.bak"
+    CERT_PATH="${HY_DIR}/cert.crt"
+    KEY_PATH="${HY_DIR}/private.key"
+    changed=1
+  fi
+  return 0
+}
+
+# 强制修正 /etc/hysteria 权限（不做 || true 静默失败）
 fix_hy_permissions() {
   local user
   user="$(get_hy_user)"
   mkdir -p "$HY_DIR"
+  chmod 755 "$HY_DIR" || true
 
-  # 证书若在 /root 下，hysteria 用户无法穿越 700 的 /root，复制进 /etc/hysteria
-  if [[ -n "${CERT_PATH:-}" && -f "${CERT_PATH:-}" ]]; then
-    case "$CERT_PATH" in
-      /root/*|/home/*)
-        local new_cert="${HY_DIR}/cert.crt"
-        local new_key="${HY_DIR}/private.key"
-        cp -f "$CERT_PATH" "$new_cert"
-        if [[ -n "${KEY_PATH:-}" && -f "${KEY_PATH:-}" ]]; then
-          cp -f "$KEY_PATH" "$new_key"
-        fi
-        CERT_PATH="$new_cert"
-        KEY_PATH="$new_key"
-        # 同步 config 里的路径（若已写出）
-        if [[ -f "$HY_CONF" ]]; then
-          # 下面 write 会覆盖；此处仅修权限场景
-          :
-        fi
-        ;;
-    esac
-  fi
+  relocate_certs_if_needed
 
-  if [[ -n "${CERT_PATH:-}" && -f "${CERT_PATH:-}" ]]; then
-    chmod 644 "$CERT_PATH" 2>/dev/null || true
-  fi
-  if [[ -n "${KEY_PATH:-}" && -f "${KEY_PATH:-}" ]]; then
-    chmod 600 "$KEY_PATH" 2>/dev/null || true
-  fi
+  # 目录内所有相关文件
   if [[ -f "$HY_CONF" ]]; then
-    chmod 644 "$HY_CONF" 2>/dev/null || true
+    # 属主可读即可；先给 644 再 chown，避免中间状态
+    chmod 644 "$HY_CONF" || true
   fi
-  chmod 755 "$HY_DIR" 2>/dev/null || true
+  if [[ -f "${HY_DIR}/cert.crt" ]]; then
+    chmod 644 "${HY_DIR}/cert.crt" || true
+  fi
+  if [[ -f "${HY_DIR}/private.key" ]]; then
+    chmod 600 "${HY_DIR}/private.key" || true
+  fi
+  if [[ -n "${CERT_PATH:-}" && -f "$CERT_PATH" ]]; then
+    chmod 644 "$CERT_PATH" || true
+  fi
+  if [[ -n "${KEY_PATH:-}" && -f "$KEY_PATH" ]]; then
+    chmod 600 "$KEY_PATH" || true
+  fi
 
-  if [[ "$user" != "root" ]] && id "$user" >/dev/null 2>&1; then
-    chown -R "$user:$user" "$HY_DIR" 2>/dev/null || true
-    if [[ -n "${CERT_PATH:-}" && -f "$CERT_PATH" ]]; then
-      chown "$user:$user" "$CERT_PATH" 2>/dev/null || true
+  if [[ "$user" != "root" ]]; then
+    if ! id "$user" >/dev/null 2>&1; then
+      warn "用户 ${user} 不存在，尝试创建..."
+      useradd -r -d /var/lib/hysteria -m "$user" 2>/dev/null || true
     fi
-    if [[ -n "${KEY_PATH:-}" && -f "$KEY_PATH" ]]; then
-      chown "$user:$user" "$KEY_PATH" 2>/dev/null || true
+    if id "$user" >/dev/null 2>&1; then
+      chown -R "${user}:${user}" "$HY_DIR" || err "chown ${HY_DIR} 失败"
+      # 配置必须归 hysteria 且可读
+      if [[ -f "$HY_CONF" ]]; then
+        chown "${user}:${user}" "$HY_CONF"
+        chmod 644 "$HY_CONF"
+      fi
+    else
+      # 极端情况：没有 hysteria 用户，放宽权限让任何用户可读配置（仅兜底）
+      warn "无 hysteria 用户，将 config 设为 644 兜底"
+      [[ -f "$HY_CONF" ]] && chmod 644 "$HY_CONF"
     fi
+  else
+    [[ -f "$HY_CONF" ]] && chmod 644 "$HY_CONF"
   fi
-  info "已修正权限（运行用户: ${user}）"
+
+  info "权限已设置（运行用户: ${user}） ls:"
+  ls -la "$HY_DIR" 2>/dev/null || true
+}
+
+# 启动前必须通过：hysteria 用户能读 config
+ensure_config_readable() {
+  fix_hy_permissions
+  local user
+  user="$(get_hy_user)"
+  [[ -f "$HY_CONF" ]] || die "配置不存在: $HY_CONF"
+
+  if [[ "$user" == "root" ]]; then
+    return 0
+  fi
+
+  if sudo -u "$user" test -r "$HY_CONF" 2>/dev/null; then
+    ok_msg="$(echo "config 对 ${user} 可读")"
+    green "[OK] $ok_msg"
+    return 0
+  fi
+
+  # 二次强制修复
+  warn "配置对 ${user} 仍不可读，强制修复..."
+  chmod 755 /etc 2>/dev/null || true
+  chmod 755 "$HY_DIR"
+  chown "${user}:${user}" "$HY_CONF"
+  chmod 644 "$HY_CONF"
+  chown -R "${user}:${user}" "$HY_DIR"
+
+  if sudo -u "$user" test -r "$HY_CONF" 2>/dev/null; then
+    green "[OK] 强制修复后 config 可读"
+    return 0
+  fi
+
+  err "无法让用户 ${user} 读取 ${HY_CONF}"
+  ls -la "$HY_DIR" || true
+  namei -l "$HY_CONF" 2>/dev/null || true
+  die "权限修复失败，请检查目录 ACL/挂载选项"
+}
+
+# 一键修复已损坏安装的权限并启动
+repair_and_start() {
+  echo
+  green "修复 Hysteria 配置/证书权限并重启服务"
+  if [[ ! -f "$HY_CONF" ]]; then
+    err "未找到 $HY_CONF，请先安装"
+    return 1
+  fi
+  # 从已有 config 解析 cert/key 路径
+  CERT_PATH="$(grep -E '^\s*cert:' "$HY_CONF" 2>/dev/null | awk '{print $2}' | tr -d '\"' | head -1 || true)"
+  KEY_PATH="$(grep -E '^\s*key:' "$HY_CONF" 2>/dev/null | awk '{print $2}' | tr -d '\"' | head -1 || true)"
+  ensure_config_readable
+  systemctl daemon-reload
+  systemctl restart "${SERVICE_NAME}.service"
+  sleep 1
+  if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    green "修复成功，服务已运行"
+    systemctl status "${SERVICE_NAME}.service" --no-pager -l | head -20 || true
+  else
+    err "修复后仍失败，日志:"
+    journalctl -u "${SERVICE_NAME}.service" -n 30 --no-pager || true
+    return 1
+  fi
 }
 
 gen_self_signed() {
@@ -607,8 +715,19 @@ choose_masquerade() {
 ### 写配置 ###
 write_server_config() {
   mkdir -p "$HY_DIR"
-  # 确保证书路径对 hysteria 用户可读
-  fix_hy_permissions
+  relocate_certs_if_needed
+  # 统一写进 /etc/hysteria，避免路径跑到 /root
+  CERT_PATH="${CERT_PATH:-${HY_DIR}/cert.crt}"
+  KEY_PATH="${KEY_PATH:-${HY_DIR}/private.key}"
+  case "$CERT_PATH" in
+    "${HY_DIR}"/*) ;;
+    *) CERT_PATH="${HY_DIR}/cert.crt" ;;
+  esac
+  case "$KEY_PATH" in
+    "${HY_DIR}"/*) ;;
+    *) KEY_PATH="${HY_DIR}/private.key" ;;
+  esac
+
   cat >"$HY_CONF" <<EOF
 # Hysteria 2 server config
 # generated by install-hy2-script v${SCRIPT_VERSION}
@@ -635,32 +754,8 @@ masquerade:
     url: https://${PROXY_SITE}
     rewriteHost: true
 EOF
-  # 配置需对 User=hysteria 可读（不可 600 root-only）
-  chmod 644 "$HY_CONF"
-  fix_hy_permissions
-}
-
-# 前台试跑配置，打印真实错误（便于排障）
-validate_hy_config() {
-  if [[ ! -x "$HY_BIN" || ! -f "$HY_CONF" ]]; then
-    return 0
-  fi
-  info "校验配置: $HY_CONF"
-  local out
-  # 短超时试跑；能启动则杀掉
-  if out="$($HY_BIN server -c "$HY_CONF" 2>&1 & spid=$!; sleep 1; kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null; true)"; then
-    :
-  fi
-  # 用 timeout 更干净
-  if command -v timeout >/dev/null 2>&1; then
-    out="$(timeout 2s "$HY_BIN" server -c "$HY_CONF" 2>&1 || true)"
-    if echo "$out" | grep -qiE 'error|failed|permission|no such|invalid|cannot'; then
-      err "配置校验输出:"
-      echo "$out" | tail -30
-      return 1
-    fi
-  fi
-  return 0
+  # 关键：chown 给 hysteria，禁止 root-only 600
+  ensure_config_readable
 }
 
 write_client_files() {
@@ -917,7 +1012,7 @@ menu_udp_optimize() {
 }
 
 service_start() {
-  fix_hy_permissions
+  ensure_config_readable
   systemctl daemon-reload
   systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
   systemctl restart "${SERVICE_NAME}.service"
@@ -928,28 +1023,29 @@ service_start() {
     err "服务启动失败，最近日志:"
     journalctl -u "${SERVICE_NAME}.service" -n 40 --no-pager || true
     echo
+    # 自动再修一次权限并重试
+    warn "自动再修权限并重试一次..."
+    ensure_config_readable
+    systemctl restart "${SERVICE_NAME}.service"
+    sleep 1
+    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+      green "重试成功，服务已启动"
+      return 0
+    fi
     err "尝试前台运行以查看错误:"
     local user
     user="$(get_hy_user)"
     if [[ "$user" != "root" ]] && id "$user" >/dev/null 2>&1; then
-      sudo -u "$user" "$HY_BIN" server -c "$HY_CONF" 2>&1 | head -40 || true
+      timeout 3s sudo -u "$user" "$HY_BIN" server -c "$HY_CONF" 2>&1 | head -40 || true
     else
-      "$HY_BIN" server -c "$HY_CONF" 2>&1 | head -40 || true
+      timeout 3s "$HY_BIN" server -c "$HY_CONF" 2>&1 | head -40 || true
     fi
-    echo
-    yellow "常见原因: 1) 配置/证书权限不是 hysteria 可读  2) 端口占用  3) 证书路径错误"
-    yellow "可执行修复: chown -R hysteria:hysteria /etc/hysteria && chmod 644 /etc/hysteria/config.yaml"
-    die "请根据日志排查后重试"
+    die "请根据日志排查后重试（管理菜单可选「修复权限并启动」）"
   fi
 }
 
-service_stop() {
-  systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
-  systemctl disable "${SERVICE_NAME}.service" 2>/dev/null || true
-  yellow "服务已停止"
-}
-
 service_restart() {
+  ensure_config_readable
   systemctl restart "${SERVICE_NAME}.service"
   sleep 1
   if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
@@ -958,6 +1054,12 @@ service_restart() {
     err "重启失败"
     journalctl -u "${SERVICE_NAME}.service" -n 30 --no-pager || true
   fi
+}
+
+service_stop() {
+  systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+  systemctl disable "${SERVICE_NAME}.service" 2>/dev/null || true
+  yellow "服务已停止"
 }
 
 is_installed() {
@@ -1431,11 +1533,12 @@ menu_manage() {
     echo -e "  ${GREEN}4.${PLAIN} 更新 Hysteria 到最新版"
     echo -e "  ${GREEN}5.${PLAIN} UDP 缓冲优化"
     echo -e "  ${GREEN}6.${PLAIN} 自动放行防火墙端口（识别 ufw/firewalld/iptables）"
-    echo -e "  ${GREEN}7.${PLAIN} 更新本脚本"
-    echo -e "  ${RED}8.${PLAIN} 卸载 Hysteria 2"
+    echo -e "  ${YELLOW}7.${PLAIN} ${YELLOW}修复权限并启动${PLAIN}（permission denied 点这个）"
+    echo -e "  ${GREEN}8.${PLAIN} 更新本脚本"
+    echo -e "  ${RED}9.${PLAIN} 卸载 Hysteria 2"
     echo -e "  ${GREEN}0.${PLAIN} 返回上级"
     echo
-    read -rp "请输入选项 [0-8]: " m
+    read -rp "请输入选项 [0-9]: " m
     case "$m" in
       1) menu_switch; pause ;;
       2) menu_change; pause ;;
@@ -1443,8 +1546,9 @@ menu_manage() {
       4) update_hysteria; pause ;;
       5) menu_udp_optimize; pause ;;
       6) reapply_firewall; pause ;;
-      7) update_script; pause ;;
-      8) do_uninstall; pause ;;
+      7) repair_and_start; pause ;;
+      8) update_script; pause ;;
+      9) do_uninstall; pause ;;
       0) return 0 ;;
       *) err "无效选项"; sleep 1 ;;
     esac
@@ -1542,6 +1646,7 @@ EOF
       exit 0
       ;;
     manage) menu_manage; exit 0 ;;
+    repair|fix) repair_and_start; exit 0 ;;
     uninstall) do_uninstall; exit 0 ;;
     update|update-hy2) update_hysteria; exit 0 ;;
     udp|optimize) menu_udp_optimize; exit 0 ;;
