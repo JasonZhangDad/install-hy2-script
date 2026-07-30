@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# Hysteria 2 一键安装脚本
+# Hysteria 2 一键安装脚本（必须 root）
 # Repo: https://github.com/JasonZhangDad/install-hy2-script
 #
-# 推荐运行方式（交互菜单，兼容 curl | bash）:
+# 推荐运行:
+#   # 已是 root
 #   bash <(curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh)
-# 或:
-#   curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh | bash
+#   # 非 root（推荐）
+#   curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh | sudo bash
 #
 
 set -euo pipefail
@@ -15,12 +16,13 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # 当通过 curl | bash 运行时，stdin 不是终端；把输入切到 /dev/tty 以支持交互
-if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
-  exec </dev/tty
+# 无 TTY 环境（CI/非交互）失败则忽略，避免脚本直接退出
+if [[ ! -t 0 ]]; then
+  exec </dev/tty 2>/dev/null || true
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 OFFICIAL_INSTALLER="https://get.hy2.sh/"
@@ -59,36 +61,70 @@ pause() {
   read -rp "按回车返回菜单..." _
 }
 
+# 是否为磁盘上的真实脚本路径（排除 /dev/fd、进程替换等）
+_is_real_script_path() {
+  local p="${1:-}"
+  [[ -n "$p" ]] || return 1
+  [[ -f "$p" && -r "$p" ]] || return 1
+  case "$p" in
+    /dev/fd/*|/proc/self/fd/*|/proc/*/fd/*) return 1 ;;
+  esac
+  return 0
+}
+
+# 必须 root：非 root 时自动 sudo 提权重跑（本地文件 / curl 管道 / 进程替换均可）
 need_root() {
   local uid
-  uid="${EUID:-$(id -u)}"
+  uid="${EUID:-$(id -u 2>/dev/null || echo 1)}"
   if [[ "$uid" -eq 0 ]]; then
     return 0
   fi
 
-  # 非 root：若有 sudo 且可提权，自动用 root 重新执行本脚本
-  if command -v sudo >/dev/null 2>&1; then
-    warn "当前不是 root，尝试通过 sudo 提权..."
-    # 保留参数；通过环境变量标记避免死循环
-    if [[ "${HY2_ROOT_REEXEC:-}" != "1" ]]; then
-      export HY2_ROOT_REEXEC=1
-      if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
-      else
-        # curl | bash / process substitution 场景：从 stdin 再跑不可靠，改为提示
-        err "请使用 root 运行，例如："
-        err "  sudo -i"
-        err "  bash <(curl -fsSL ${REPO_RAW})"
-        err "或："
-        err "  curl -fsSL ${REPO_RAW} | sudo bash"
-        exit 1
-      fi
-    fi
+  if [[ "${HY2_ROOT_REEXEC:-}" == "1" ]]; then
+    err "已尝试 sudo 提权，但仍不是 root。请手动执行："
+    err "  curl -fsSL ${REPO_RAW} | sudo bash"
+    exit 1
   fi
 
-  err "本脚本必须使用 root 权限运行（安装服务、改防火墙、写 /etc 需要）"
-  err "请执行: sudo -i   然后再运行脚本"
-  err "或: curl -fsSL ${REPO_RAW} | sudo bash"
+  if ! command -v sudo >/dev/null 2>&1; then
+    err "本脚本必须使用 root 权限运行，且系统未找到 sudo。"
+    err "请切换 root 后执行: bash <(curl -fsSL ${REPO_RAW})"
+    exit 1
+  fi
+
+  warn "当前用户 $(id -un) (uid=${uid}) 不是 root，正在通过 sudo 提权重新执行..."
+
+  local src="${BASH_SOURCE[0]:-}"
+  # 1) 本地真实文件：直接 sudo bash 该文件
+  if _is_real_script_path "$src"; then
+    exec sudo -E env HY2_ROOT_REEXEC=1 bash "$src" "$@"
+  fi
+
+  # 2) curl|bash / process substitution：落到临时文件再 sudo
+  local tmp
+  tmp="$(mktemp /tmp/install-hy2.XXXXXX.sh)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" EXIT
+
+  if command -v curl >/dev/null 2>&1 && curl -fsSL "$REPO_RAW" -o "$tmp" 2>/dev/null; then
+    chmod 700 "$tmp"
+    trap - EXIT
+    exec sudo -E env HY2_ROOT_REEXEC=1 bash "$tmp" "$@"
+  fi
+
+  # 3) 进程替换仍可读时，拷贝当前脚本内容
+  if [[ -n "$src" && -r "$src" ]] && cat "$src" >"$tmp" 2>/dev/null; then
+    chmod 700 "$tmp"
+    trap - EXIT
+    exec sudo -E env HY2_ROOT_REEXEC=1 bash "$tmp" "$@"
+  fi
+
+  rm -f "$tmp" 2>/dev/null || true
+  trap - EXIT
+  err "无法自动提权。请用 root 运行，任选其一："
+  err "  sudo -i"
+  err "  bash <(curl -fsSL ${REPO_RAW})"
+  err "  curl -fsSL ${REPO_RAW} | sudo bash"
   exit 1
 }
 
@@ -1319,10 +1355,10 @@ menu() {
   echo "#############################################################"
   echo -e "#          ${GREEN}Hysteria 2 安装脚本${PLAIN}  v${SCRIPT_VERSION}                #"
   echo -e "#   ${BLUE}https://github.com/JasonZhangDad/install-hy2-script${PLAIN}  #"
-  echo -e "#   ${YELLOW}权限: 必须 root${PLAIN}（uid=$(id -u) user=$(id -un)）          #"
+  echo -e "#   ${YELLOW}权限: ROOT 已确认${PLAIN}  uid=$(id -u)  user=$(id -un)          #"
   echo "#############################################################"
   echo
-  green "请选择安装模式："
+  green "请选择安装模式（当前为 root，可继续）:"
   echo
   echo -e "  ${GREEN}1.${PLAIN} 交互式安装"
   echo -e "      逐步选择：证书类型 / 端口 / 密码 / 伪装站 / 端口跳跃"
@@ -1355,11 +1391,43 @@ menu() {
 }
 
 main() {
-  # 传入全部参数，便于 sudo 重跑时保留子命令
+  # version/help 允许非 root 查看
+  case "${1:-}" in
+    version|--version|-v)
+      echo "install-hy2-script v${SCRIPT_VERSION}"
+      exit 0
+      ;;
+    help|--help|-h)
+      cat <<EOF
+install-hy2-script v${SCRIPT_VERSION}
+【必须 root】安装/管理 Hysteria 2 需要 root 权限。
+
+用法:
+  bash install-hy2.sh                 主菜单（交互式 / 一键）
+  bash install-hy2.sh interactive     交互式安装
+  bash install-hy2.sh onekey          一键安装
+  bash install-hy2.sh manage          管理菜单
+  bash install-hy2.sh update          更新 Hysteria
+  bash install-hy2.sh udp             UDP 缓冲优化
+  bash install-hy2.sh uninstall       卸载
+  bash install-hy2.sh show            显示配置
+
+推荐运行（root）:
+  bash <(curl -fsSL ${REPO_RAW})
+
+非 root 请用 sudo（脚本也会尝试自动 sudo）:
+  curl -fsSL ${REPO_RAW} | sudo bash
+  sudo bash install-hy2.sh
+EOF
+      exit 0
+      ;;
+  esac
+
+  # 强制 root（非 root 自动 sudo 重跑）
   need_root "$@"
+  green "[OK] root 权限检查通过 (uid=$(id -u) user=$(id -un))"
   detect_os
 
-  # 命令行直接指定模式（跳过主菜单）
   case "${1:-}" in
     install|interactive)
       yellow "模式：交互式安装"
@@ -1376,27 +1444,6 @@ main() {
     update|update-hy2) update_hysteria; exit 0 ;;
     udp|optimize) menu_udp_optimize; exit 0 ;;
     show) show_conf; exit 0 ;;
-    version|--version|-v) echo "install-hy2-script v${SCRIPT_VERSION}"; exit 0 ;;
-    help|--help|-h)
-      cat <<EOF
-用法（必须 root 或 sudo）:
-  bash install-hy2.sh                 主菜单（选 交互式 / 一键）
-  bash install-hy2.sh interactive     交互式安装
-  bash install-hy2.sh onekey          一键安装（全默认）
-  bash install-hy2.sh manage          管理菜单
-  bash install-hy2.sh update          更新 Hysteria
-  bash install-hy2.sh udp             UDP 缓冲优化
-  bash install-hy2.sh uninstall       卸载
-  bash install-hy2.sh show            显示配置
-
-推荐（root）:
-  bash <(curl -fsSL ${REPO_RAW})
-
-非 root 时:
-  curl -fsSL ${REPO_RAW} | sudo bash
-EOF
-      exit 0
-      ;;
   esac
 
   while true; do

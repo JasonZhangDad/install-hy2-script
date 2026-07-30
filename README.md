@@ -2,17 +2,22 @@
 
 Hysteria 2（hy2）一键安装脚本：交互菜单、多系统支持、自签 / ACME / 自定义证书、端口跳跃、客户端 YAML/JSON/分享链接/二维码。
 
-## 权限要求（必须 root）
+## 权限要求（必须 root）✅
 
-本脚本 **必须以 root 运行**。安装二进制、写 `/etc`、操作 systemd、改防火墙、sysctl 都需要 root。
+本脚本 **强制 root**。启动时会检查 `uid==0`：
+
+- 已是 root → 继续  
+- 非 root → **自动 `sudo` 提权重跑**（本地文件 / `curl|bash` / 进程替换均支持）  
+- 无 sudo 或提权失败 → 退出并提示正确命令  
+
+需要 root 的原因：写 `/usr/local/bin`、`/etc/hysteria`、systemd、防火墙、sysctl、`/root/hy`。
 
 | 方式 | 命令 |
 |------|------|
 | 已是 root | `bash <(curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh)` |
-| 普通用户 | `curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh \| sudo bash` |
+| 普通用户（推荐） | `curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh \| sudo bash` |
 | 先提权 | `sudo -i` 后再执行脚本 |
-
-非 root 时：若本地文件执行且存在 `sudo`，会尝试自动 `sudo` 重跑；`curl \| bash` 场景请直接加 `sudo bash`。
+| 本地文件 | `sudo bash install-hy2.sh` |
 
 ## 一键运行（推荐）
 
@@ -20,7 +25,7 @@ Hysteria 2（hy2）一键安装脚本：交互菜单、多系统支持、自签 
 # root
 bash <(curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh)
 
-# 非 root
+# 非 root（推荐写法）
 curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh | sudo bash
 ```
 
