@@ -20,7 +20,8 @@ if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
+SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 OFFICIAL_INSTALLER="https://get.hy2.sh/"
 HY_BIN="/usr/local/bin/hysteria"
@@ -618,19 +619,143 @@ EOF
 }
 
 ### 服务控制 ###
+# install_binary [force|ask]
+#   force — 强制装最新版；ask — 已安装时询问；其它 — 已安装则跳过
 install_binary() {
+  local mode="${1:-ask}"
   info "安装 Hysteria 2 官方二进制..."
   if [[ -x "$HY_BIN" ]]; then
     yellow "已检测到 hysteria: $($HY_BIN version 2>/dev/null | head -1 || echo present)"
-    read -rp "是否强制重新安装最新版？[y/N]: " force
-    if [[ "${force,,}" == "y" || "${force,,}" == "yes" ]]; then
+    if [[ "$mode" == "force" ]]; then
       bash <(curl -fsSL "$OFFICIAL_INSTALLER") --force || die "官方安装器执行失败"
+    elif [[ "$mode" == "ask" ]]; then
+      read -rp "是否强制重新安装最新版？[y/N]: " force
+      if [[ "${force,,}" == "y" || "${force,,}" == "yes" ]]; then
+        bash <(curl -fsSL "$OFFICIAL_INSTALLER") --force || die "官方安装器执行失败"
+      fi
+    else
+      info "已安装，跳过下载（需要更新请用菜单「更新 Hysteria」）"
     fi
   else
     bash <(curl -fsSL "$OFFICIAL_INSTALLER") || die "官方安装器执行失败"
   fi
   [[ -x "$HY_BIN" ]] || die "未找到 $HY_BIN，安装失败"
   green "Hysteria 安装成功: $($HY_BIN version 2>/dev/null | head -1 || echo OK)"
+}
+
+# 更新 Hysteria 到最新版（保留现有配置与证书）
+update_hysteria() {
+  if [[ ! -x "$HY_BIN" ]]; then
+    err "未检测到 hysteria 二进制，请先安装"
+    return 0
+  fi
+  local before after
+  before="$($HY_BIN version 2>/dev/null | head -1 || echo unknown)"
+  yellow "当前版本: $before"
+  read -rp "确认更新到官方最新版？[Y/n]: " ans
+  ans="${ans:-Y}"
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 0
+
+  ensure_deps
+  bash <(curl -fsSL "$OFFICIAL_INSTALLER") --force || die "更新失败"
+  after="$($HY_BIN version 2>/dev/null | head -1 || echo unknown)"
+  green "更新完成"
+  yellow "之前: $before"
+  yellow "现在: $after"
+
+  if [[ -f "$HY_CONF" ]]; then
+    read -rp "是否重启 ${SERVICE_NAME} 使新版本生效？[Y/n]: " r
+    r="${r:-Y}"
+    if [[ "${r,,}" == "y" || "${r,,}" == "yes" ]]; then
+      service_restart
+    fi
+  else
+    yellow "未找到服务端配置，跳过重启"
+  fi
+}
+
+### UDP 缓冲优化（对 Hysteria/QUIC 更直接）###
+show_udp_sysctl() {
+  echo
+  blue "──────── 当前 UDP / 网络缓冲相关参数 ────────"
+  local keys=(
+    net.core.rmem_max
+    net.core.wmem_max
+    net.core.rmem_default
+    net.core.wmem_default
+    net.core.netdev_max_backlog
+    net.ipv4.udp_rmem_min
+    net.ipv4.udp_wmem_min
+  )
+  local k cur
+  for k in "${keys[@]}"; do
+    cur="$(sysctl -n "$k" 2>/dev/null || echo N/A)"
+    printf "  %-32s %s\n" "$k" "$cur"
+  done
+  if [[ -f "$SYSCTL_HY2_CONF" ]]; then
+    green "已应用脚本优化文件: $SYSCTL_HY2_CONF"
+  else
+    yellow "尚未通过本脚本写入优化文件"
+  fi
+}
+
+apply_udp_optimize() {
+  info "写入 UDP 缓冲优化: $SYSCTL_HY2_CONF"
+  cat >"$SYSCTL_HY2_CONF" <<'EOF'
+# Hysteria 2 / QUIC UDP buffer tuning (install-hy2-script)
+# 增大套接字缓冲，减少高吞吐时丢包
+
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
+net.core.netdev_max_backlog = 16384
+
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+EOF
+
+  if sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_HY2_CONF" >/dev/null 2>&1; then
+    green "UDP 缓冲优化已生效"
+  else
+    # 逐条应用，兼容精简系统
+    sysctl -w net.core.rmem_max=33554432 >/dev/null 2>&1 || true
+    sysctl -w net.core.wmem_max=33554432 >/dev/null 2>&1 || true
+    sysctl -w net.core.rmem_default=16777216 >/dev/null 2>&1 || true
+    sysctl -w net.core.wmem_default=16777216 >/dev/null 2>&1 || true
+    sysctl -w net.core.netdev_max_backlog=16384 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.udp_rmem_min=8192 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.udp_wmem_min=8192 >/dev/null 2>&1 || true
+    green "UDP 缓冲优化已尝试应用（部分参数可能不受当前内核支持）"
+  fi
+  show_udp_sysctl
+}
+
+remove_udp_optimize() {
+  if [[ ! -f "$SYSCTL_HY2_CONF" ]]; then
+    yellow "未找到 $SYSCTL_HY2_CONF，无需恢复"
+    return 0
+  fi
+  rm -f "$SYSCTL_HY2_CONF"
+  sysctl --system >/dev/null 2>&1 || true
+  green "已删除脚本优化文件。重启后其余参数以系统默认为准；当前运行中的值可能仍偏大，重启系统可完全恢复。"
+}
+
+menu_udp_optimize() {
+  echo
+  green "UDP 缓冲优化（利于 Hysteria 2 / QUIC 高吞吐）:"
+  echo -e "  ${GREEN}1.${PLAIN} 查看当前参数"
+  echo -e "  ${GREEN}2.${PLAIN} 应用优化（写入 ${SYSCTL_HY2_CONF}）"
+  echo -e "  ${GREEN}3.${PLAIN} 移除本脚本的优化文件"
+  echo -e "  ${GREEN}0.${PLAIN} 返回"
+  echo
+  read -rp "请选择 [0-3]: " u
+  case "$u" in
+    1) show_udp_sysctl ;;
+    2) apply_udp_optimize ;;
+    3) remove_udp_optimize ;;
+    *) ;;
+  esac
 }
 
 service_start() {
@@ -699,7 +824,7 @@ do_install() {
   fi
 
   ensure_deps
-  install_binary
+  install_binary ask
   choose_cert
   choose_port
   choose_password
@@ -711,6 +836,55 @@ do_install() {
   echo
   green "=========================================="
   green " Hysteria 2 安装完成"
+  green "=========================================="
+  show_conf
+}
+
+# 极速安装：全默认，无逐步询问
+# 自签 www.bing.com + 随机端口 + 随机密码 + 伪装 www.bing.com + 单端口
+do_quick_install() {
+  echo
+  green "极速安装将使用以下默认值:"
+  echo "  证书: 自签 (SNI=${DEFAULT_SNI})"
+  echo "  端口: 随机 UDP（单端口，无跳跃）"
+  echo "  密码: 随机"
+  echo "  伪装: ${DEFAULT_MASQUERADE}"
+  echo
+  if is_installed; then
+    warn "检测到已安装，继续将覆盖现有配置"
+  fi
+  read -rp "确认开始极速安装？[Y/n]: " ans
+  ans="${ans:-Y}"
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 0
+
+  if is_installed; then
+    clear_port_hop_rules
+  fi
+
+  ensure_deps
+  install_binary skip
+
+  gen_self_signed "$DEFAULT_SNI"
+  PORT="$(pick_free_udp_port)"
+  LAST_PORT="$PORT"
+  HOP_FIRST=""
+  HOP_LAST=""
+  meta_set hop_first ""
+  meta_set hop_last ""
+  AUTH_PWD="$(rand_pwd)"
+  PROXY_SITE="$DEFAULT_MASQUERADE"
+
+  yellow "主端口: $PORT"
+  yellow "密码: $AUTH_PWD"
+
+  write_server_config
+  write_client_files
+  service_start
+  hint_firewall "$PORT"
+
+  echo
+  green "=========================================="
+  green " Hysteria 2 极速安装完成"
   green "=========================================="
   show_conf
 }
@@ -930,24 +1104,30 @@ menu() {
   echo -e "#   ${BLUE}https://github.com/JasonZhangDad/install-hy2-script${PLAIN}  #"
   echo "#############################################################"
   echo
-  echo -e "  ${GREEN}1.${PLAIN} 安装 Hysteria 2"
-  echo -e "  ${RED}2.${PLAIN} 卸载 Hysteria 2"
+  echo -e "  ${GREEN}1.${PLAIN} 安装 Hysteria 2（逐步配置）"
+  echo -e "  ${GREEN}2.${PLAIN} 极速安装（全默认：自签 bing + 随机端口/密码）"
+  echo -e "  ${RED}3.${PLAIN} 卸载 Hysteria 2"
   echo "  -----------------------------------------------"
-  echo -e "  ${GREEN}3.${PLAIN} 启动 / 停止 / 重启"
-  echo -e "  ${GREEN}4.${PLAIN} 修改配置（端口/密码/证书/伪装站）"
-  echo -e "  ${GREEN}5.${PLAIN} 显示配置（YAML / JSON / 链接 / 二维码）"
+  echo -e "  ${GREEN}4.${PLAIN} 启动 / 停止 / 重启"
+  echo -e "  ${GREEN}5.${PLAIN} 修改配置（端口/密码/证书/伪装站）"
+  echo -e "  ${GREEN}6.${PLAIN} 显示配置（YAML / JSON / 链接 / 二维码）"
   echo "  -----------------------------------------------"
-  echo -e "  ${GREEN}6.${PLAIN} 更新本脚本"
+  echo -e "  ${GREEN}7.${PLAIN} 更新 Hysteria 到最新版"
+  echo -e "  ${GREEN}8.${PLAIN} UDP 缓冲优化"
+  echo -e "  ${GREEN}9.${PLAIN} 更新本脚本"
   echo -e "  ${GREEN}0.${PLAIN} 退出"
   echo
-  read -rp "请输入选项 [0-6]: " input
+  read -rp "请输入选项 [0-9]: " input
   case "$input" in
     1) do_install; pause ;;
-    2) do_uninstall; pause ;;
-    3) menu_switch; pause ;;
-    4) menu_change; pause ;;
-    5) show_conf; pause ;;
-    6) update_script; pause ;;
+    2) do_quick_install; pause ;;
+    3) do_uninstall; pause ;;
+    4) menu_switch; pause ;;
+    5) menu_change; pause ;;
+    6) show_conf; pause ;;
+    7) update_hysteria; pause ;;
+    8) menu_udp_optimize; pause ;;
+    9) update_script; pause ;;
     0) exit 0 ;;
     *) err "无效选项"; sleep 1 ;;
   esac
@@ -959,15 +1139,21 @@ main() {
 
   # 非交互快捷参数（可选）
   case "${1:-}" in
-    install) ensure_deps; do_install; exit 0 ;;
+    install) do_install; exit 0 ;;
+    quick|install-auto) do_quick_install; exit 0 ;;
     uninstall) do_uninstall; exit 0 ;;
+    update|update-hy2) update_hysteria; exit 0 ;;
+    udp|optimize) menu_udp_optimize; exit 0 ;;
     show) show_conf; exit 0 ;;
     version|--version|-v) echo "install-hy2-script v${SCRIPT_VERSION}"; exit 0 ;;
     help|--help|-h)
       cat <<EOF
 用法:
   bash install-hy2.sh              交互菜单
-  bash install-hy2.sh install      直接进入安装流程
+  bash install-hy2.sh install      逐步安装向导
+  bash install-hy2.sh quick        极速安装（全默认）
+  bash install-hy2.sh update       更新 Hysteria 到最新版
+  bash install-hy2.sh udp          UDP 缓冲优化菜单
   bash install-hy2.sh uninstall    卸载
   bash install-hy2.sh show         显示配置
 
