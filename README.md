@@ -19,24 +19,41 @@ Hysteria 2（hy2）一键安装脚本：交互菜单、多系统支持、自签 
 | 先提权 | `sudo -i` 后再执行脚本 |
 | 本地文件 | `sudo bash install-hy2.sh` |
 
-## 一键运行（推荐）
+## 一键运行（推荐：四步合一）
+
+复制下面 **一条命令** 即可，自动完成：
+
+1. **root 提权**（等同 `sudo -i`）  
+2. **更新软件源 / 软件包** + 安装 curl 等依赖  
+3. **执行** `install-hy2.sh`（菜单：交互式 / 一键）  
+4. **开放端口规则**（本机防火墙：TCP 80/443/8080、UDP 443，以及 hy2 实际端口）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/start.sh | sudo bash
+```
+
+一键安装（跳过菜单，全默认）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/start.sh | sudo bash -s -- onekey
+```
+
+交互式安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/start.sh | sudo bash -s -- interactive
+```
+
+> 云厂商 **安全组** 仍需在网页控制台放行相同 UDP 端口。
+
+### 仅运行安装脚本（不含更新系统）
 
 ```bash
 # root
 bash <(curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh)
 
-# 非 root（推荐写法）
+# 非 root
 curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh | sudo bash
-```
-
-> 脚本会在 `curl | bash` 时自动从 `/dev/tty` 读取交互输入。若环境无 TTY，请先下载再执行。
-
-### 下载后执行
-
-```bash
-curl -fsSL -o install-hy2.sh https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh
-chmod +x install-hy2.sh
-sudo bash install-hy2.sh
 ```
 
 ## 功能一览
