@@ -1,0 +1,986 @@
+#!/usr/bin/env bash
+#
+# Hysteria 2 一键安装脚本
+# Repo: https://github.com/JasonZhangDad/install-hy2-script
+#
+# 推荐运行方式（交互菜单，兼容 curl | bash）:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh)
+# 或:
+#   curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh | bash
+#
+
+set -euo pipefail
+
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
+# 当通过 curl | bash 运行时，stdin 不是终端；把输入切到 /dev/tty 以支持交互
+if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
+  exec </dev/tty
+fi
+
+### 常量 ###
+SCRIPT_VERSION="1.0.0"
+REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
+OFFICIAL_INSTALLER="https://get.hy2.sh/"
+HY_BIN="/usr/local/bin/hysteria"
+HY_DIR="/etc/hysteria"
+HY_CONF="${HY_DIR}/config.yaml"
+HY_META="${HY_DIR}/install.meta"
+CLIENT_DIR="/root/hy"
+SERVICE_NAME="hysteria-server"
+DEFAULT_SNI="www.bing.com"
+DEFAULT_MASQUERADE="www.bing.com"
+
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+PLAIN="\033[0m"
+BOLD="\033[1m"
+
+### 工具函数 ###
+red()    { echo -e "${RED}${BOLD}$*${PLAIN}"; }
+green()  { echo -e "${GREEN}${BOLD}$*${PLAIN}"; }
+yellow() { echo -e "${YELLOW}${BOLD}$*${PLAIN}"; }
+blue()   { echo -e "${BLUE}${BOLD}$*${PLAIN}"; }
+info()   { echo -e "${GREEN}[INFO]${PLAIN} $*"; }
+warn()   { echo -e "${YELLOW}[WARN]${PLAIN} $*"; }
+err()    { echo -e "${RED}[ERROR]${PLAIN} $*" >&2; }
+
+die() {
+  err "$*"
+  exit 1
+}
+
+pause() {
+  echo
+  read -rp "按回车返回菜单..." _
+}
+
+need_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 用户运行（sudo -i 后执行）"
+}
+
+rand_pwd() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 8
+  else
+    date +%s%N | md5sum 2>/dev/null | cut -c1-16 || tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 16
+  fi
+}
+
+rand_port() {
+  shuf -i 10000-65000 -n 1 2>/dev/null || echo $((RANDOM % 55000 + 10000))
+}
+
+is_port_in_use_udp() {
+  local p="$1"
+  ss -H -ulnp 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qx "$p"
+}
+
+pick_free_udp_port() {
+  local port="${1:-}"
+  if [[ -z "$port" ]]; then
+    port="$(rand_port)"
+  fi
+  local tries=0
+  while is_port_in_use_udp "$port"; do
+    tries=$((tries + 1))
+    [[ $tries -gt 50 ]] && die "无法找到可用的 UDP 端口"
+    if [[ -n "${1:-}" ]]; then
+      err "UDP 端口 $port 已被占用，请重新输入"
+      read -rp "设置 Hysteria 2 端口 [1-65535]（回车随机）: " port
+      [[ -z "$port" ]] && port="$(rand_port)"
+    else
+      port="$(rand_port)"
+    fi
+  done
+  echo "$port"
+}
+
+validate_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] && ((p >= 1 && p <= 65535))
+}
+
+# 简单校验域名
+validate_domain() {
+  local d="$1"
+  [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+### 系统检测与包管理 ###
+detect_os() {
+  local sys=""
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    sys="${ID:-}${ID_LIKE:-}"
+    PRETTY_OS="${PRETTY_NAME:-$ID}"
+  else
+    sys="$(uname -s)"
+    PRETTY_OS="$sys"
+  fi
+  sys="$(echo "$sys" | tr '[:upper:]' '[:lower:]')"
+
+  if echo "$sys" | grep -Eq 'debian|ubuntu'; then
+    OS_FAMILY="debian"
+    PKG_UPDATE="apt-get update -y"
+    PKG_INSTALL="apt-get install -y"
+    PKG_REMOVE="apt-get remove -y"
+  elif echo "$sys" | grep -Eq 'centos|rhel|rocky|alma|oracle|fedora|amazon|opencloud|anolis|euler'; then
+    OS_FAMILY="rhel"
+    if command -v dnf >/dev/null 2>&1; then
+      PKG_UPDATE="dnf -y makecache"
+      PKG_INSTALL="dnf -y install"
+      PKG_REMOVE="dnf -y remove"
+    else
+      PKG_UPDATE="yum -y makecache"
+      PKG_INSTALL="yum -y install"
+      PKG_REMOVE="yum -y remove"
+    fi
+  elif echo "$sys" | grep -Eq 'arch|manjaro'; then
+    OS_FAMILY="arch"
+    PKG_UPDATE="pacman -Sy --noconfirm"
+    PKG_INSTALL="pacman -S --noconfirm --needed"
+    PKG_REMOVE="pacman -R --noconfirm"
+  else
+    die "暂不支持当前系统: ${PRETTY_OS:-unknown}。支持 Debian/Ubuntu/CentOS/RHEL/Rocky/Alma/Fedora/Amazon/Arch。"
+  fi
+  info "检测到系统: ${PRETTY_OS} (${OS_FAMILY})"
+}
+
+pkg_install() {
+  # shellcheck disable=SC2086
+  $PKG_INSTALL "$@"
+}
+
+ensure_deps() {
+  local deps=(curl wget openssl ca-certificates)
+  local missing=()
+  local d
+  for d in "${deps[@]}"; do
+    if ! command -v "$d" >/dev/null 2>&1; then
+      # ca-certificates 没有同名命令
+      if [[ "$d" == "ca-certificates" ]]; then
+        missing+=("$d")
+      else
+        missing+=("$d")
+      fi
+    fi
+  done
+
+  # 始终尝试补齐常用工具
+  local extra=(qrencode socat cron)
+  if [[ "$OS_FAMILY" == "rhel" ]]; then
+    extra=(qrencode socat cronie)
+  elif [[ "$OS_FAMILY" == "arch" ]]; then
+    extra=(qrencode socat cronie)
+  fi
+
+  info "安装依赖..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    # shellcheck disable=SC2086
+    $PKG_UPDATE >/dev/null 2>&1 || true
+  fi
+
+  # qrencode / iptables-persistent 可能不在默认源，失败不致命
+  pkg_install curl wget openssl ca-certificates 2>/dev/null || pkg_install curl wget openssl || true
+
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    pkg_install qrencode socat cron iptables iptables-persistent netfilter-persistent 2>/dev/null || \
+      pkg_install qrencode socat cron iptables 2>/dev/null || true
+  elif [[ "$OS_FAMILY" == "rhel" ]]; then
+    pkg_install qrencode socat cronie iptables iptables-services 2>/dev/null || \
+      pkg_install socat cronie iptables 2>/dev/null || true
+  else
+    pkg_install qrencode socat cronie iptables 2>/dev/null || true
+  fi
+
+  command -v curl >/dev/null 2>&1 || die "curl 安装失败"
+  command -v openssl >/dev/null 2>&1 || die "openssl 安装失败"
+}
+
+### 网络 / IP ###
+get_public_ip() {
+  local ip=""
+  ip="$(curl -fsS4 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -fsS4 --max-time 8 https://ifconfig.me 2>/dev/null || true)"
+  fi
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -fsS6 --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
+  fi
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -fsS4 --max-time 8 https://ip.sb 2>/dev/null || true)"
+  fi
+  echo "$ip"
+}
+
+format_host() {
+  local ip="$1"
+  if [[ "$ip" == *:* ]]; then
+    echo "[$ip]"
+  else
+    echo "$ip"
+  fi
+}
+
+### meta 读写（避免 sed 行号踩坑）###
+meta_set() {
+  local key="$1" value="$2"
+  mkdir -p "$HY_DIR"
+  touch "$HY_META"
+  if grep -qE "^${key}=" "$HY_META" 2>/dev/null; then
+    # 使用 | 分隔避免路径中 / 冲突
+    sed -i.bak "s|^${key}=.*|${key}=${value}|" "$HY_META" && rm -f "${HY_META}.bak"
+  else
+    echo "${key}=${value}" >>"$HY_META"
+  fi
+}
+
+meta_get() {
+  local key="$1" default="${2:-}"
+  if [[ -f "$HY_META" ]] && grep -qE "^${key}=" "$HY_META"; then
+    grep -E "^${key}=" "$HY_META" | tail -1 | cut -d= -f2-
+  else
+    echo "$default"
+  fi
+}
+
+### 证书 ###
+gen_self_signed() {
+  local sni="${1:-$DEFAULT_SNI}"
+  mkdir -p "$HY_DIR"
+  local cert="${HY_DIR}/cert.crt"
+  local key="${HY_DIR}/private.key"
+
+  openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null
+  openssl req -new -x509 -days 36500 -key "$key" -out "$cert" \
+    -subj "/CN=${sni}" 2>/dev/null
+  chmod 600 "$key"
+  chmod 644 "$cert"
+
+  CERT_PATH="$cert"
+  KEY_PATH="$key"
+  HY_DOMAIN="$sni"
+  CERT_MODE="self"
+  CLIENT_INSECURE="true"
+  green "已生成自签证书，SNI/CN: $sni"
+}
+
+install_acme_cert() {
+  local domain="$1"
+  [[ -n "$domain" ]] || die "域名不能为空"
+  validate_domain "$domain" || die "域名格式不合法: $domain"
+
+  local ip
+  ip="$(get_public_ip)"
+  [[ -n "$ip" ]] || die "无法获取本机公网 IP，请检查网络"
+
+  info "本机公网 IP: $ip"
+  info "检查域名 ${domain} 解析..."
+  local resolved
+  resolved="$(curl -fsS --max-time 10 "https://1.1.1.1/dns-query?name=${domain}&type=A" \
+    -H 'accept: application/dns-json' 2>/dev/null | grep -oE '"data":"[0-9.]+"' | head -1 | cut -d\" -f4 || true)"
+  if [[ -z "$resolved" ]]; then
+    resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -1 || true)"
+  fi
+  if [[ -z "$resolved" ]]; then
+    resolved="$(dig +short A "$domain" 2>/dev/null | head -1 || true)"
+  fi
+
+  if [[ -n "$resolved" && "$resolved" != "$ip" ]]; then
+    warn "域名解析 IP ($resolved) 与本机公网 IP ($ip) 不一致"
+    yellow "若使用了 CDN（如 Cloudflare 小黄云），请先关闭代理仅保留 DNS"
+    read -rp "仍要继续申请证书？[y/N]: " cont
+    [[ "${cont,,}" == "y" || "${cont,,}" == "yes" ]] || die "已取消 ACME 申请"
+  fi
+
+  # 安装 acme.sh
+  if [[ ! -f /root/.acme.sh/acme.sh ]]; then
+    info "安装 acme.sh ..."
+    curl -fsSL https://get.acme.sh | sh -s email="hy2-$(date +%s)@example.com" || die "acme.sh 安装失败"
+  fi
+  # shellcheck disable=SC1091
+  source /root/.acme.sh/acme.sh.env 2>/dev/null || true
+
+  local acme="/root/.acme.sh/acme.sh"
+  [[ -x "$acme" ]] || acme="bash /root/.acme.sh/acme.sh"
+
+  $acme --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+  # standalone 需要 80 端口
+  if ss -H -tlnp 2>/dev/null | awk '{print $4}' | grep -Eq '(:|\\.)80$'; then
+    warn "检测到 80 端口被占用，ACME HTTP-01 可能失败"
+    read -rp "是否继续？[y/N]: " cont
+    [[ "${cont,,}" == "y" || "${cont,,}" == "yes" ]] || die "已取消"
+  fi
+
+  info "申请证书: $domain"
+  local issue_args=(-d "$domain" --standalone -k ec-256 --force)
+  if [[ "$ip" == *:* ]]; then
+    issue_args+=(--listen-v6)
+  fi
+  if ! $acme --issue "${issue_args[@]}"; then
+    die "证书申请失败。请确认: 1) 域名已解析到本机 2) 80 端口可达 3) 防火墙已放行 80/tcp"
+  fi
+
+  local cert="/root/hy2-cert/cert.crt"
+  local key="/root/hy2-cert/private.key"
+  mkdir -p /root/hy2-cert
+  $acme --install-cert -d "$domain" --ecc \
+    --fullchain-file "$cert" \
+    --key-file "$key" \
+    --reloadcmd "systemctl restart ${SERVICE_NAME}.service 2>/dev/null || true" \
+    || die "证书安装失败"
+
+  chmod 600 "$key"
+  chmod 644 "$cert"
+
+  CERT_PATH="$cert"
+  KEY_PATH="$key"
+  HY_DOMAIN="$domain"
+  CERT_MODE="acme"
+  CLIENT_INSECURE="false"
+  green "ACME 证书申请成功: $domain"
+}
+
+choose_cert() {
+  echo
+  green "证书申请方式:"
+  echo -e "  ${GREEN}1.${PLAIN} 自签证书 ${YELLOW}（默认，SNI=${DEFAULT_SNI}）${PLAIN}"
+  echo -e "  ${GREEN}2.${PLAIN} ACME 自动申请（需域名解析到本机）"
+  echo -e "  ${GREEN}3.${PLAIN} 自定义证书路径"
+  echo
+  read -rp "请输入选项 [1-3]（回车默认 1）: " cert_input
+  cert_input="${cert_input:-1}"
+
+  case "$cert_input" in
+    2)
+      read -rp "请输入域名: " domain
+      [[ -n "$domain" ]] || die "未输入域名"
+      install_acme_cert "$domain"
+      ;;
+    3)
+      read -rp "请输入证书（fullchain/crt）路径: " cert_path
+      read -rp "请输入私钥（key）路径: " key_path
+      read -rp "请输入证书对应域名/SNI: " domain
+      [[ -f "$cert_path" && -s "$cert_path" ]] || die "证书文件不存在或为空: $cert_path"
+      [[ -f "$key_path" && -s "$key_path" ]] || die "私钥文件不存在或为空: $key_path"
+      [[ -n "$domain" ]] || die "域名/SNI 不能为空"
+      CERT_PATH="$cert_path"
+      KEY_PATH="$key_path"
+      HY_DOMAIN="$domain"
+      CERT_MODE="custom"
+      CLIENT_INSECURE="false"
+      read -rp "客户端是否跳过证书校验 insecure？[y/N]（自签或域名不匹配时选 y）: " inc
+      if [[ "${inc,,}" == "y" || "${inc,,}" == "yes" ]]; then
+        CLIENT_INSECURE="true"
+      fi
+      green "已使用自定义证书，SNI: $domain"
+      ;;
+    *)
+      read -rp "自签证书 SNI/CN（回车默认 ${DEFAULT_SNI}）: " sni
+      sni="${sni:-$DEFAULT_SNI}"
+      gen_self_signed "$sni"
+      ;;
+  esac
+}
+
+### 端口 / 端口跳跃 ###
+clear_port_hop_rules() {
+  local first last mainp
+  first="$(meta_get hop_first)"
+  last="$(meta_get hop_last)"
+  mainp="$(meta_get port)"
+  if [[ -n "$first" && -n "$last" && -n "$mainp" ]]; then
+    iptables -t nat -D PREROUTING -p udp --dport "${first}:${last}" -j DNAT --to-destination ":${mainp}" 2>/dev/null || true
+    ip6tables -t nat -D PREROUTING -p udp --dport "${first}:${last}" -j DNAT --to-destination ":${mainp}" 2>/dev/null || true
+  fi
+}
+
+apply_port_hop() {
+  local first="$1" last="$2" mainp="$3"
+  iptables -t nat -A PREROUTING -p udp --dport "${first}:${last}" -j DNAT --to-destination ":${mainp}" 2>/dev/null || \
+    warn "iptables 规则添加失败（可能缺少权限或未安装 iptables）"
+  ip6tables -t nat -A PREROUTING -p udp --dport "${first}:${last}" -j DNAT --to-destination ":${mainp}" 2>/dev/null || true
+
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  elif command -v service >/dev/null 2>&1; then
+    service iptables save >/dev/null 2>&1 || true
+  fi
+
+  meta_set hop_first "$first"
+  meta_set hop_last "$last"
+}
+
+choose_port() {
+  echo
+  read -rp "设置 Hysteria 2 端口 [1-65535]（回车随机）: " port_in
+  if [[ -n "$port_in" ]]; then
+    validate_port "$port_in" || die "端口不合法: $port_in"
+  fi
+  PORT="$(pick_free_udp_port "${port_in:-}")"
+  yellow "主端口: $PORT"
+
+  echo
+  green "端口模式:"
+  echo -e "  ${GREEN}1.${PLAIN} 单端口 ${YELLOW}（默认）${PLAIN}"
+  echo -e "  ${GREEN}2.${PLAIN} 端口跳跃（iptables DNAT 一段 UDP 端口到主端口）"
+  echo
+  read -rp "请输入选项 [1-2]（回车默认 1）: " jump_in
+  jump_in="${jump_in:-1}"
+
+  HOP_FIRST=""
+  HOP_LAST=""
+  LAST_PORT="$PORT"
+
+  if [[ "$jump_in" == "2" ]]; then
+    read -rp "起始端口（建议 10000-65535）: " HOP_FIRST
+    read -rp "结束端口（必须大于起始端口）: " HOP_LAST
+    validate_port "$HOP_FIRST" || die "起始端口不合法"
+    validate_port "$HOP_LAST" || die "结束端口不合法"
+    ((HOP_FIRST < HOP_LAST)) || die "起始端口必须小于结束端口"
+    apply_port_hop "$HOP_FIRST" "$HOP_LAST" "$PORT"
+    LAST_PORT="${PORT},${HOP_FIRST}-${HOP_LAST}"
+    green "已启用端口跳跃: ${HOP_FIRST}-${HOP_LAST} -> ${PORT}"
+  else
+    meta_set hop_first ""
+    meta_set hop_last ""
+  fi
+}
+
+choose_password() {
+  echo
+  read -rp "设置连接密码（回车随机）: " AUTH_PWD
+  AUTH_PWD="${AUTH_PWD:-$(rand_pwd)}"
+  yellow "密码: $AUTH_PWD"
+}
+
+choose_masquerade() {
+  echo
+  read -rp "伪装网站（去掉 https://，回车默认 ${DEFAULT_MASQUERADE}）: " PROXY_SITE
+  PROXY_SITE="${PROXY_SITE:-$DEFAULT_MASQUERADE}"
+  # 去掉协议和路径
+  PROXY_SITE="${PROXY_SITE#https://}"
+  PROXY_SITE="${PROXY_SITE#http://}"
+  PROXY_SITE="${PROXY_SITE%%/*}"
+  yellow "伪装站: $PROXY_SITE"
+}
+
+### 写配置 ###
+write_server_config() {
+  mkdir -p "$HY_DIR"
+  cat >"$HY_CONF" <<EOF
+# Hysteria 2 server config
+# generated by install-hy2-script v${SCRIPT_VERSION}
+
+listen: :${PORT}
+
+tls:
+  cert: ${CERT_PATH}
+  key: ${KEY_PATH}
+
+auth:
+  type: password
+  password: ${AUTH_PWD}
+
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${PROXY_SITE}
+    rewriteHost: true
+EOF
+  chmod 600 "$HY_CONF"
+}
+
+write_client_files() {
+  local ip host insecure_yaml insecure_json insecure_url
+  ip="$(get_public_ip)"
+  if [[ -z "$ip" ]]; then
+    warn "无法自动获取公网 IP，客户端配置中的 server 将使用占位符"
+    ip="YOUR_SERVER_IP"
+  fi
+  host="$(format_host "$ip")"
+
+  if [[ "${CLIENT_INSECURE}" == "true" ]]; then
+    insecure_yaml="true"
+    insecure_json="true"
+    insecure_url="1"
+  else
+    insecure_yaml="false"
+    insecure_json="false"
+    insecure_url="0"
+  fi
+
+  mkdir -p "$CLIENT_DIR"
+
+  cat >"${CLIENT_DIR}/hy-client.yaml" <<EOF
+server: ${host}:${LAST_PORT}
+
+auth: ${AUTH_PWD}
+
+tls:
+  sni: ${HY_DOMAIN}
+  insecure: ${insecure_yaml}
+
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+
+fastOpen: true
+
+socks5:
+  listen: 127.0.0.1:5678
+
+http:
+  listen: 127.0.0.1:5679
+
+transport:
+  udp:
+    hopInterval: 30s
+EOF
+
+  cat >"${CLIENT_DIR}/hy-client.json" <<EOF
+{
+  "server": "${host}:${LAST_PORT}",
+  "auth": "${AUTH_PWD}",
+  "tls": {
+    "sni": "${HY_DOMAIN}",
+    "insecure": ${insecure_json}
+  },
+  "quic": {
+    "initStreamReceiveWindow": 16777216,
+    "maxStreamReceiveWindow": 16777216,
+    "initConnReceiveWindow": 33554432,
+    "maxConnReceiveWindow": 33554432
+  },
+  "fastOpen": true,
+  "socks5": {
+    "listen": "127.0.0.1:5678"
+  },
+  "http": {
+    "listen": "127.0.0.1:5679"
+  },
+  "transport": {
+    "udp": {
+      "hopInterval": "30s"
+    }
+  }
+}
+EOF
+
+  local remark="Hysteria2"
+  local url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${insecure_url}&sni=${HY_DOMAIN}#${remark}"
+  # 端口跳跃时，分享链接主端口仍用主 listen 端口；跳跃范围写在备注
+  if [[ -n "${HOP_FIRST:-}" && -n "${HOP_LAST:-}" ]]; then
+    url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${insecure_url}&sni=${HY_DOMAIN}&mport=${HOP_FIRST}-${HOP_LAST}#${remark}"
+  fi
+  echo "$url" >"${CLIENT_DIR}/url.txt"
+
+  # 二维码
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t ANSIUTF8 -o "${CLIENT_DIR}/url-qr.txt" "$url" 2>/dev/null || \
+      qrencode -t UTF8 "$url" >"${CLIENT_DIR}/url-qr.txt" 2>/dev/null || true
+    qrencode -t PNG -o "${CLIENT_DIR}/url-qr.png" "$url" 2>/dev/null || true
+  fi
+
+  # 持久化 meta
+  meta_set port "$PORT"
+  meta_set last_port "$LAST_PORT"
+  meta_set password "$AUTH_PWD"
+  meta_set domain "$HY_DOMAIN"
+  meta_set cert_path "$CERT_PATH"
+  meta_set key_path "$KEY_PATH"
+  meta_set cert_mode "$CERT_MODE"
+  meta_set insecure "$CLIENT_INSECURE"
+  meta_set masquerade "$PROXY_SITE"
+  meta_set public_ip "$ip"
+  if [[ -n "${HOP_FIRST:-}" ]]; then
+    meta_set hop_first "$HOP_FIRST"
+    meta_set hop_last "$HOP_LAST"
+  else
+    meta_set hop_first ""
+    meta_set hop_last ""
+  fi
+}
+
+### 服务控制 ###
+install_binary() {
+  info "安装 Hysteria 2 官方二进制..."
+  if [[ -x "$HY_BIN" ]]; then
+    yellow "已检测到 hysteria: $($HY_BIN version 2>/dev/null | head -1 || echo present)"
+    read -rp "是否强制重新安装最新版？[y/N]: " force
+    if [[ "${force,,}" == "y" || "${force,,}" == "yes" ]]; then
+      bash <(curl -fsSL "$OFFICIAL_INSTALLER") --force || die "官方安装器执行失败"
+    fi
+  else
+    bash <(curl -fsSL "$OFFICIAL_INSTALLER") || die "官方安装器执行失败"
+  fi
+  [[ -x "$HY_BIN" ]] || die "未找到 $HY_BIN，安装失败"
+  green "Hysteria 安装成功: $($HY_BIN version 2>/dev/null | head -1 || echo OK)"
+}
+
+service_start() {
+  systemctl daemon-reload
+  systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+  systemctl restart "${SERVICE_NAME}.service"
+  sleep 1
+  if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    green "服务已启动: ${SERVICE_NAME}"
+  else
+    err "服务启动失败，最近日志:"
+    journalctl -u "${SERVICE_NAME}.service" -n 30 --no-pager || true
+    die "请根据日志排查后重试"
+  fi
+}
+
+service_stop() {
+  systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+  systemctl disable "${SERVICE_NAME}.service" 2>/dev/null || true
+  yellow "服务已停止"
+}
+
+service_restart() {
+  systemctl restart "${SERVICE_NAME}.service"
+  sleep 1
+  if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    green "服务已重启"
+  else
+    err "重启失败"
+    journalctl -u "${SERVICE_NAME}.service" -n 30 --no-pager || true
+  fi
+}
+
+is_installed() {
+  [[ -x "$HY_BIN" && -f "$HY_CONF" ]]
+}
+
+### 防火墙提示 ###
+hint_firewall() {
+  local p="$1"
+  echo
+  yellow "请确保防火墙 / 安全组放行 UDP ${p}"
+  if [[ -n "${HOP_FIRST:-}" && -n "${HOP_LAST:-}" ]]; then
+    yellow "端口跳跃还需放行 UDP ${HOP_FIRST}-${HOP_LAST}"
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    read -rp "检测到 ufw 已启用，是否自动放行 UDP ${p}？[Y/n]: " ans
+    ans="${ans:-Y}"
+    if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
+      ufw allow "${p}/udp" >/dev/null 2>&1 || true
+      if [[ -n "${HOP_FIRST:-}" && -n "${HOP_LAST:-}" ]]; then
+        ufw allow "${HOP_FIRST}:${HOP_LAST}/udp" >/dev/null 2>&1 || true
+      fi
+      green "已添加 ufw 规则"
+    fi
+  fi
+}
+
+### 安装主流程 ###
+do_install() {
+  if is_installed; then
+    warn "检测到已安装 Hysteria 2"
+    read -rp "继续将覆盖现有配置，是否继续？[y/N]: " ans
+    [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 0
+    clear_port_hop_rules
+  fi
+
+  ensure_deps
+  install_binary
+  choose_cert
+  choose_port
+  choose_password
+  choose_masquerade
+  write_server_config
+  write_client_files
+  service_start
+  hint_firewall "$PORT"
+  echo
+  green "=========================================="
+  green " Hysteria 2 安装完成"
+  green "=========================================="
+  show_conf
+}
+
+### 卸载 ###
+do_uninstall() {
+  if ! is_installed && [[ ! -x "$HY_BIN" ]]; then
+    warn "未检测到安装"
+    return 0
+  fi
+  read -rp "确认卸载 Hysteria 2？[y/N]: " ans
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 0
+
+  service_stop
+  clear_port_hop_rules
+
+  # 用官方脚本删二进制和 unit（保留我们自己的配置目录手动清理）
+  if curl -fsSL "$OFFICIAL_INSTALLER" -o /tmp/get-hy2.sh 2>/dev/null; then
+    bash /tmp/get-hy2.sh --remove 2>/dev/null || true
+    rm -f /tmp/get-hy2.sh
+  fi
+
+  rm -rf "$HY_DIR" "$CLIENT_DIR"
+  rm -f /root/hy2-cert/cert.crt /root/hy2-cert/private.key 2>/dev/null || true
+  # 不自动删除 acme.sh，避免影响其它站点证书
+
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  fi
+
+  green "Hysteria 2 已卸载"
+}
+
+### 服务开关菜单 ###
+menu_switch() {
+  echo
+  green "服务管理:"
+  echo -e "  ${GREEN}1.${PLAIN} 启动"
+  echo -e "  ${GREEN}2.${PLAIN} 停止"
+  echo -e "  ${GREEN}3.${PLAIN} 重启"
+  echo -e "  ${GREEN}0.${PLAIN} 返回"
+  echo
+  read -rp "请选择 [0-3]: " s
+  case "$s" in
+    1) service_start ;;
+    2) service_stop ;;
+    3) service_restart ;;
+    *) ;;
+  esac
+}
+
+### 从 meta / 现有配置加载变量 ###
+load_from_meta() {
+  PORT="$(meta_get port)"
+  LAST_PORT="$(meta_get last_port "$PORT")"
+  AUTH_PWD="$(meta_get password)"
+  HY_DOMAIN="$(meta_get domain "$DEFAULT_SNI")"
+  CERT_PATH="$(meta_get cert_path "${HY_DIR}/cert.crt")"
+  KEY_PATH="$(meta_get key_path "${HY_DIR}/private.key")"
+  CERT_MODE="$(meta_get cert_mode self)"
+  CLIENT_INSECURE="$(meta_get insecure true)"
+  PROXY_SITE="$(meta_get masquerade "$DEFAULT_MASQUERADE")"
+  HOP_FIRST="$(meta_get hop_first)"
+  HOP_LAST="$(meta_get hop_last)"
+}
+
+### 修改配置 ###
+change_port() {
+  is_installed || die "尚未安装"
+  load_from_meta
+  clear_port_hop_rules
+  choose_port
+  # 保留其它字段
+  write_server_config
+  write_client_files
+  service_restart
+  hint_firewall "$PORT"
+  green "端口已更新"
+  show_conf
+}
+
+change_password() {
+  is_installed || die "尚未安装"
+  load_from_meta
+  choose_password
+  write_server_config
+  write_client_files
+  service_restart
+  green "密码已更新"
+  show_conf
+}
+
+change_cert() {
+  is_installed || die "尚未安装"
+  load_from_meta
+  choose_cert
+  write_server_config
+  write_client_files
+  service_restart
+  green "证书已更新"
+  show_conf
+}
+
+change_masquerade() {
+  is_installed || die "尚未安装"
+  load_from_meta
+  choose_masquerade
+  write_server_config
+  write_client_files
+  service_restart
+  green "伪装网站已更新为: $PROXY_SITE"
+  show_conf
+}
+
+menu_change() {
+  is_installed || { err "尚未安装"; return 0; }
+  echo
+  green "修改配置:"
+  echo -e "  ${GREEN}1.${PLAIN} 修改端口 / 端口跳跃"
+  echo -e "  ${GREEN}2.${PLAIN} 修改密码"
+  echo -e "  ${GREEN}3.${PLAIN} 修改证书"
+  echo -e "  ${GREEN}4.${PLAIN} 修改伪装网站"
+  echo -e "  ${GREEN}0.${PLAIN} 返回"
+  echo
+  read -rp "请选择 [0-4]: " c
+  case "$c" in
+    1) change_port ;;
+    2) change_password ;;
+    3) change_cert ;;
+    4) change_masquerade ;;
+    *) ;;
+  esac
+}
+
+### 显示配置 ###
+show_conf() {
+  if [[ ! -f "${CLIENT_DIR}/url.txt" ]]; then
+    if is_installed; then
+      warn "客户端文件缺失，尝试根据现有配置重新生成..."
+      load_from_meta
+      if [[ -z "$PORT" || -z "$AUTH_PWD" ]]; then
+        err "meta 不完整，请重新安装"
+        return 0
+      fi
+      write_client_files
+    else
+      err "未找到配置，请先安装"
+      return 0
+    fi
+  fi
+
+  echo
+  blue "──────── 服务端配置 ${HY_CONF} ────────"
+  if [[ -f "$HY_CONF" ]]; then
+    cat "$HY_CONF"
+  fi
+
+  echo
+  blue "──────── 客户端 YAML ${CLIENT_DIR}/hy-client.yaml ────────"
+  cat "${CLIENT_DIR}/hy-client.yaml"
+
+  echo
+  blue "──────── 客户端 JSON ${CLIENT_DIR}/hy-client.json ────────"
+  cat "${CLIENT_DIR}/hy-client.json"
+
+  echo
+  blue "──────── 分享链接 ${CLIENT_DIR}/url.txt ────────"
+  red "$(cat "${CLIENT_DIR}/url.txt")"
+
+  if [[ -f "${CLIENT_DIR}/url-qr.txt" ]]; then
+    echo
+    blue "──────── 分享链接二维码 ────────"
+    cat "${CLIENT_DIR}/url-qr.txt"
+  elif command -v qrencode >/dev/null 2>&1; then
+    echo
+    blue "──────── 分享链接二维码 ────────"
+    qrencode -t ANSIUTF8 "$(cat "${CLIENT_DIR}/url.txt")" 2>/dev/null || true
+  else
+    yellow "未安装 qrencode，跳过终端二维码（可 apt/yum install qrencode）"
+  fi
+
+  if [[ -f "${CLIENT_DIR}/url-qr.png" ]]; then
+    yellow "二维码图片: ${CLIENT_DIR}/url-qr.png"
+  fi
+
+  echo
+  yellow "客户端文件目录: ${CLIENT_DIR}/"
+  if systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    green "服务状态: active (running)"
+  else
+    red "服务状态: inactive / 未运行"
+  fi
+}
+
+update_script() {
+  info "从 GitHub 拉取最新脚本..."
+  local tmp
+  tmp="$(mktemp)"
+  if curl -fsSL "$REPO_RAW" -o "$tmp"; then
+    local target="/usr/local/bin/install-hy2"
+    cp "$tmp" "$target"
+    chmod +x "$target"
+    rm -f "$tmp"
+    green "已更新到 $target"
+    yellow "重新运行: install-hy2  或  bash $target"
+  else
+    rm -f "$tmp"
+    err "下载失败"
+  fi
+}
+
+### 主菜单 ###
+menu() {
+  clear
+  echo "#############################################################"
+  echo -e "#          ${GREEN}Hysteria 2 一键安装脚本${PLAIN}  v${SCRIPT_VERSION}           #"
+  echo -e "#   ${BLUE}https://github.com/JasonZhangDad/install-hy2-script${PLAIN}  #"
+  echo "#############################################################"
+  echo
+  echo -e "  ${GREEN}1.${PLAIN} 安装 Hysteria 2"
+  echo -e "  ${RED}2.${PLAIN} 卸载 Hysteria 2"
+  echo "  -----------------------------------------------"
+  echo -e "  ${GREEN}3.${PLAIN} 启动 / 停止 / 重启"
+  echo -e "  ${GREEN}4.${PLAIN} 修改配置（端口/密码/证书/伪装站）"
+  echo -e "  ${GREEN}5.${PLAIN} 显示配置（YAML / JSON / 链接 / 二维码）"
+  echo "  -----------------------------------------------"
+  echo -e "  ${GREEN}6.${PLAIN} 更新本脚本"
+  echo -e "  ${GREEN}0.${PLAIN} 退出"
+  echo
+  read -rp "请输入选项 [0-6]: " input
+  case "$input" in
+    1) do_install; pause ;;
+    2) do_uninstall; pause ;;
+    3) menu_switch; pause ;;
+    4) menu_change; pause ;;
+    5) show_conf; pause ;;
+    6) update_script; pause ;;
+    0) exit 0 ;;
+    *) err "无效选项"; sleep 1 ;;
+  esac
+}
+
+main() {
+  need_root
+  detect_os
+
+  # 非交互快捷参数（可选）
+  case "${1:-}" in
+    install) ensure_deps; do_install; exit 0 ;;
+    uninstall) do_uninstall; exit 0 ;;
+    show) show_conf; exit 0 ;;
+    version|--version|-v) echo "install-hy2-script v${SCRIPT_VERSION}"; exit 0 ;;
+    help|--help|-h)
+      cat <<EOF
+用法:
+  bash install-hy2.sh              交互菜单
+  bash install-hy2.sh install      直接进入安装流程
+  bash install-hy2.sh uninstall    卸载
+  bash install-hy2.sh show         显示配置
+
+推荐一键:
+  bash <(curl -fsSL ${REPO_RAW})
+EOF
+      exit 0
+      ;;
+  esac
+
+  while true; do
+    menu
+  done
+}
+
+main "$@"
