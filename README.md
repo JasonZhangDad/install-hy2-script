@@ -39,6 +39,7 @@ bash install-hy2.sh
 | 改配置 | 端口、密码、证书、伪装站 |
 | **更新 Hysteria** | 官方安装器 `--force` 升到最新版，保留现有配置 |
 | **UDP 缓冲优化** | 增大 `rmem/wmem` 等，利于 QUIC 高吞吐；可查看 / 应用 / 移除 |
+| **防火墙自动识别** | 优先 **ufw** → **firewalld** → **iptables**，安装后自动放行 UDP 端口 |
 | 客户端输出 | `/root/hy/hy-client.yaml`、`hy-client.json`、`url.txt`、二维码 |
 
 ## 菜单
@@ -60,10 +61,25 @@ bash install-hy2.sh
 3. 显示配置
 4. 更新 Hysteria 到最新版
 5. UDP 缓冲优化
-6. 更新本脚本
-7. 卸载 Hysteria 2
+6. 自动放行防火墙端口（识别 ufw / firewalld / iptables）
+7. 更新本脚本
+8. 卸载 Hysteria 2
 0. 返回
 ```
+
+### 防火墙策略
+
+安装或改端口后，脚本会 **自动检测** 本机防火墙并放行 hy2 的 UDP 端口：
+
+| 检测结果 | 使用命令 |
+|----------|----------|
+| ufw 状态为 active | `ufw allow <port>/udp` |
+| firewalld 在运行 | `firewall-cmd --permanent --add-port=.../udp` |
+| 其它且有 iptables | `iptables -I INPUT -p udp --dport ... -j ACCEPT`（并尝试持久化） |
+| 都没有 | 仅提示去云安全组放行 |
+
+ACME 申请证书时会额外按同一逻辑放行 **TCP 80**。  
+**云厂商安全组**仍需在网页控制台单独放行（脚本改不了）。
 
 ## 支持系统
 

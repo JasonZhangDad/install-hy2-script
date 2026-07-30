@@ -20,7 +20,7 @@ if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 OFFICIAL_INSTALLER="https://get.hy2.sh/"
@@ -319,6 +319,10 @@ install_acme_cert() {
     read -rp "是否继续？[y/N]: " cont
     [[ "${cont,,}" == "y" || "${cont,,}" == "yes" ]] || die "已取消"
   fi
+
+  # ACME HTTP-01 需要 80/tcp：按当前防火墙自动放行
+  info "为 ACME 申请证书，自动放行 TCP 80..."
+  open_firewall_tcp 80
 
   info "申请证书: $domain"
   local issue_args=(-d "$domain" --standalone -k ec-256 --force)
@@ -793,25 +797,171 @@ is_installed() {
   [[ -x "$HY_BIN" && -f "$HY_CONF" ]]
 }
 
-### 防火墙提示 ###
-hint_firewall() {
-  local p="$1"
-  echo
-  yellow "请确保防火墙 / 安全组放行 UDP ${p}"
-  if [[ -n "${HOP_FIRST:-}" && -n "${HOP_LAST:-}" ]]; then
-    yellow "端口跳跃还需放行 UDP ${HOP_FIRST}-${HOP_LAST}"
-  fi
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    read -rp "检测到 ufw 已启用，是否自动放行 UDP ${p}？[Y/n]: " ans
-    ans="${ans:-Y}"
-    if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
-      ufw allow "${p}/udp" >/dev/null 2>&1 || true
-      if [[ -n "${HOP_FIRST:-}" && -n "${HOP_LAST:-}" ]]; then
-        ufw allow "${HOP_FIRST}:${HOP_LAST}/udp" >/dev/null 2>&1 || true
-      fi
-      green "已添加 ufw 规则"
+### 防火墙：自动识别 ufw / firewalld / iptables ###
+# 优先级：正在运行的 ufw > 正在运行的 firewalld > iptables > 无
+detect_firewall() {
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qiE 'Status:\s*active'; then
+      echo "ufw"
+      return 0
     fi
   fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if systemctl is-active --quiet firewalld 2>/dev/null || firewall-cmd --state 2>/dev/null | grep -qi running; then
+      echo "firewalld"
+      return 0
+    fi
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    echo "iptables"
+    return 0
+  fi
+  echo "none"
+}
+
+persist_iptables() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 && return 0
+  fi
+  if command -v service >/dev/null 2>&1; then
+    service iptables save >/dev/null 2>&1 && return 0
+  fi
+  if [[ -d /etc/sysconfig ]]; then
+    iptables-save >/etc/sysconfig/iptables 2>/dev/null && return 0
+  fi
+  if [[ -d /etc/iptables ]]; then
+    mkdir -p /etc/iptables
+    iptables-save >/etc/iptables/rules.v4 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+# 仅放行 TCP 端口（ACME 80 等）
+open_firewall_tcp() {
+  local tport="$1"
+  local fw
+  fw="$(detect_firewall)"
+  case "$fw" in
+    ufw)
+      ufw allow "${tport}/tcp" comment "hysteria2-tcp" >/dev/null 2>&1 || ufw allow "${tport}/tcp" >/dev/null 2>&1 || true
+      ufw reload >/dev/null 2>&1 || true
+      green "ufw 已放行 TCP ${tport}"
+      ;;
+    firewalld)
+      firewall-cmd --permanent --add-port="${tport}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      green "firewalld 已放行 TCP ${tport}"
+      ;;
+    iptables)
+      iptables -D INPUT -p tcp --dport "$tport" -j ACCEPT 2>/dev/null || true
+      iptables -I INPUT -p tcp --dport "$tport" -j ACCEPT 2>/dev/null || true
+      persist_iptables || true
+      green "iptables 已放行 TCP ${tport}"
+      ;;
+    *)
+      yellow "未检测到本机防火墙，请手动/在安全组放行 TCP ${tport}"
+      ;;
+  esac
+}
+
+# 放行 UDP 主端口；可选端口跳跃段
+# 用法: open_firewall <udp_port> [hop_first] [hop_last]
+open_firewall() {
+  local p="$1"
+  local hop_first="${2:-${HOP_FIRST:-}}"
+  local hop_last="${3:-${HOP_LAST:-}}"
+  local fw
+  fw="$(detect_firewall)"
+
+  echo
+  info "防火墙检测结果: ${fw}"
+
+  case "$fw" in
+    ufw)
+      info "使用 ufw 放行端口..."
+      ufw allow "${p}/udp" comment "hysteria2" >/dev/null 2>&1 || ufw allow "${p}/udp" >/dev/null 2>&1 || warn "ufw 放行 UDP ${p} 失败"
+      if [[ -n "$hop_first" && -n "$hop_last" ]]; then
+        ufw allow "${hop_first}:${hop_last}/udp" comment "hysteria2-hop" >/dev/null 2>&1 || \
+          ufw allow "${hop_first}:${hop_last}/udp" >/dev/null 2>&1 || warn "ufw 放行 UDP ${hop_first}-${hop_last} 失败"
+      fi
+      ufw reload >/dev/null 2>&1 || true
+      green "已通过 ufw 放行 UDP ${p}${hop_first:+, 跳跃 ${hop_first}-${hop_last}}"
+      ;;
+    firewalld)
+      info "使用 firewalld 放行端口..."
+      firewall-cmd --permanent --add-port="${p}/udp" >/dev/null 2>&1 || warn "firewalld 放行 UDP ${p} 失败"
+      if [[ -n "$hop_first" && -n "$hop_last" ]]; then
+        firewall-cmd --permanent --add-port="${hop_first}-${hop_last}/udp" >/dev/null 2>&1 || \
+          warn "firewalld 放行 UDP ${hop_first}-${hop_last} 失败"
+      fi
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      green "已通过 firewalld 放行 UDP ${p}${hop_first:+, 跳跃 ${hop_first}-${hop_last}}"
+      ;;
+    iptables)
+      info "使用 iptables 放行端口..."
+      # 避免重复插入：先删再加（忽略失败）
+      iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+      iptables -I INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || warn "iptables 放行 UDP ${p} 失败"
+      if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+        ip6tables -I INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+      fi
+      if [[ -n "$hop_first" && -n "$hop_last" ]]; then
+        iptables -D INPUT -p udp --dport "${hop_first}:${hop_last}" -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT -p udp --dport "${hop_first}:${hop_last}" -j ACCEPT 2>/dev/null || true
+        if command -v ip6tables >/dev/null 2>&1; then
+          ip6tables -D INPUT -p udp --dport "${hop_first}:${hop_last}" -j ACCEPT 2>/dev/null || true
+          ip6tables -I INPUT -p udp --dport "${hop_first}:${hop_last}" -j ACCEPT 2>/dev/null || true
+        fi
+      fi
+      if persist_iptables; then
+        green "已通过 iptables 放行，并尝试持久化规则"
+      else
+        green "已通过 iptables 放行 UDP ${p}${hop_first:+, 跳跃 ${hop_first}-${hop_last}}"
+        yellow "未能自动持久化 iptables，重启后可能失效；可安装 iptables-persistent 或手动 iptables-save"
+      fi
+      ;;
+    *)
+      warn "未检测到本机防火墙工具（或 ufw/firewalld 均未启用）"
+      yellow "若云厂商有安全组，请在控制台放行: UDP ${p}${hop_first:+ 以及 ${hop_first}-${hop_last}}"
+      return 0
+      ;;
+  esac
+
+  meta_set firewall_backend "$fw"
+  yellow "提醒: 云服务器请同时在「安全组 / 防火墙」控制台放行相同 UDP 端口"
+}
+
+# 安装后调用：按 meta/全局变量自动放行
+hint_firewall() {
+  local p="${1:-}"
+  if [[ -z "$p" ]]; then
+    p="$(meta_get port)"
+  fi
+  if [[ -z "$p" ]]; then
+    warn "无端口信息，跳过防火墙配置"
+    return 0
+  fi
+  local hf hl
+  hf="${HOP_FIRST:-$(meta_get hop_first)}"
+  hl="${HOP_LAST:-$(meta_get hop_last)}"
+  open_firewall "$p" "$hf" "$hl"
+}
+
+# 管理菜单：重新检测并放行当前 hy2 端口
+reapply_firewall() {
+  load_from_meta
+  if [[ -z "${PORT:-}" ]]; then
+    err "未找到已安装端口，请先安装"
+    return 0
+  fi
+  echo
+  green "当前节点端口: UDP ${PORT}"
+  if [[ -n "${HOP_FIRST:-}" && -n "${HOP_LAST:-}" ]]; then
+    green "端口跳跃: ${HOP_FIRST}-${HOP_LAST}"
+  fi
+  echo -e "  将自动识别: ${GREEN}ufw${PLAIN} / ${GREEN}firewalld${PLAIN} / ${GREEN}iptables${PLAIN}"
+  open_firewall "$PORT" "${HOP_FIRST:-}" "${HOP_LAST:-}"
 }
 
 ### 安装主流程 ###
@@ -1104,24 +1254,30 @@ menu_manage() {
     echo -e "#                    ${GREEN}管理功能${PLAIN}                              #"
     echo "#############################################################"
     echo
+    local fw_now
+    fw_now="$(detect_firewall)"
+    echo -e "  当前防火墙: ${YELLOW}${fw_now}${PLAIN}"
+    echo
     echo -e "  ${GREEN}1.${PLAIN} 启动 / 停止 / 重启"
     echo -e "  ${GREEN}2.${PLAIN} 修改配置（端口/密码/证书/伪装站）"
     echo -e "  ${GREEN}3.${PLAIN} 显示配置（YAML / JSON / 链接 / 二维码）"
     echo -e "  ${GREEN}4.${PLAIN} 更新 Hysteria 到最新版"
     echo -e "  ${GREEN}5.${PLAIN} UDP 缓冲优化"
-    echo -e "  ${GREEN}6.${PLAIN} 更新本脚本"
-    echo -e "  ${RED}7.${PLAIN} 卸载 Hysteria 2"
+    echo -e "  ${GREEN}6.${PLAIN} 自动放行防火墙端口（识别 ufw/firewalld/iptables）"
+    echo -e "  ${GREEN}7.${PLAIN} 更新本脚本"
+    echo -e "  ${RED}8.${PLAIN} 卸载 Hysteria 2"
     echo -e "  ${GREEN}0.${PLAIN} 返回上级"
     echo
-    read -rp "请输入选项 [0-7]: " m
+    read -rp "请输入选项 [0-8]: " m
     case "$m" in
       1) menu_switch; pause ;;
       2) menu_change; pause ;;
       3) show_conf; pause ;;
       4) update_hysteria; pause ;;
       5) menu_udp_optimize; pause ;;
-      6) update_script; pause ;;
-      7) do_uninstall; pause ;;
+      6) reapply_firewall; pause ;;
+      7) update_script; pause ;;
+      8) do_uninstall; pause ;;
       0) return 0 ;;
       *) err "无效选项"; sleep 1 ;;
     esac
