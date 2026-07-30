@@ -20,7 +20,7 @@ if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 OFFICIAL_INSTALLER="https://get.hy2.sh/"
@@ -60,7 +60,36 @@ pause() {
 }
 
 need_root() {
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 用户运行（sudo -i 后执行）"
+  local uid
+  uid="${EUID:-$(id -u)}"
+  if [[ "$uid" -eq 0 ]]; then
+    return 0
+  fi
+
+  # 非 root：若有 sudo 且可提权，自动用 root 重新执行本脚本
+  if command -v sudo >/dev/null 2>&1; then
+    warn "当前不是 root，尝试通过 sudo 提权..."
+    # 保留参数；通过环境变量标记避免死循环
+    if [[ "${HY2_ROOT_REEXEC:-}" != "1" ]]; then
+      export HY2_ROOT_REEXEC=1
+      if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+      else
+        # curl | bash / process substitution 场景：从 stdin 再跑不可靠，改为提示
+        err "请使用 root 运行，例如："
+        err "  sudo -i"
+        err "  bash <(curl -fsSL ${REPO_RAW})"
+        err "或："
+        err "  curl -fsSL ${REPO_RAW} | sudo bash"
+        exit 1
+      fi
+    fi
+  fi
+
+  err "本脚本必须使用 root 权限运行（安装服务、改防火墙、写 /etc 需要）"
+  err "请执行: sudo -i   然后再运行脚本"
+  err "或: curl -fsSL ${REPO_RAW} | sudo bash"
+  exit 1
 }
 
 rand_pwd() {
@@ -1290,6 +1319,7 @@ menu() {
   echo "#############################################################"
   echo -e "#          ${GREEN}Hysteria 2 安装脚本${PLAIN}  v${SCRIPT_VERSION}                #"
   echo -e "#   ${BLUE}https://github.com/JasonZhangDad/install-hy2-script${PLAIN}  #"
+  echo -e "#   ${YELLOW}权限: 必须 root${PLAIN}（uid=$(id -u) user=$(id -un)）          #"
   echo "#############################################################"
   echo
   green "请选择安装模式："
@@ -1301,7 +1331,7 @@ menu() {
   echo -e "      全默认：自签 ${DEFAULT_SNI} + 随机端口 + 随机密码 + 伪装 ${DEFAULT_MASQUERADE}"
   echo
   echo "  -----------------------------------------------"
-  echo -e "  ${GREEN}3.${PLAIN} 管理功能（启停 / 改配置 / 更新 / 卸载 / UDP 优化）"
+  echo -e "  ${GREEN}3.${PLAIN} 管理功能（启停 / 改配置 / 更新 / 卸载 / UDP 优化 / 防火墙）"
   echo -e "  ${GREEN}0.${PLAIN} 退出"
   echo
   read -rp "请输入选项 [0-3]: " input
@@ -1325,7 +1355,8 @@ menu() {
 }
 
 main() {
-  need_root
+  # 传入全部参数，便于 sudo 重跑时保留子命令
+  need_root "$@"
   detect_os
 
   # 命令行直接指定模式（跳过主菜单）
@@ -1348,7 +1379,7 @@ main() {
     version|--version|-v) echo "install-hy2-script v${SCRIPT_VERSION}"; exit 0 ;;
     help|--help|-h)
       cat <<EOF
-用法:
+用法（必须 root 或 sudo）:
   bash install-hy2.sh                 主菜单（选 交互式 / 一键）
   bash install-hy2.sh interactive     交互式安装
   bash install-hy2.sh onekey          一键安装（全默认）
@@ -1358,8 +1389,11 @@ main() {
   bash install-hy2.sh uninstall       卸载
   bash install-hy2.sh show            显示配置
 
-推荐:
+推荐（root）:
   bash <(curl -fsSL ${REPO_RAW})
+
+非 root 时:
+  curl -fsSL ${REPO_RAW} | sudo bash
 EOF
       exit 0
       ;;

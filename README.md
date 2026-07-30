@@ -2,16 +2,26 @@
 
 Hysteria 2（hy2）一键安装脚本：交互菜单、多系统支持、自签 / ACME / 自定义证书、端口跳跃、客户端 YAML/JSON/分享链接/二维码。
 
+## 权限要求（必须 root）
+
+本脚本 **必须以 root 运行**。安装二进制、写 `/etc`、操作 systemd、改防火墙、sysctl 都需要 root。
+
+| 方式 | 命令 |
+|------|------|
+| 已是 root | `bash <(curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh)` |
+| 普通用户 | `curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh \| sudo bash` |
+| 先提权 | `sudo -i` 后再执行脚本 |
+
+非 root 时：若本地文件执行且存在 `sudo`，会尝试自动 `sudo` 重跑；`curl \| bash` 场景请直接加 `sudo bash`。
+
 ## 一键运行（推荐）
 
 ```bash
+# root
 bash <(curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh)
-```
 
-等价写法：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh | bash
+# 非 root
+curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh | sudo bash
 ```
 
 > 脚本会在 `curl | bash` 时自动从 `/dev/tty` 读取交互输入。若环境无 TTY，请先下载再执行。
@@ -21,26 +31,27 @@ curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/ma
 ```bash
 curl -fsSL -o install-hy2.sh https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh
 chmod +x install-hy2.sh
-bash install-hy2.sh
+sudo bash install-hy2.sh
 ```
 
-## 功能
+## 功能一览
 
-| 功能 | 说明 |
-|------|------|
-| **交互式安装** | 逐步选择证书 / 端口 / 密码 / 伪装 / 端口跳跃 |
-| **一键安装** | 全默认：自签 `www.bing.com` + 随机端口/密码 + 伪装 bing |
-| 卸载 | 使用官方 [get.hy2.sh](https://get.hy2.sh/) 管理二进制 |
-| 证书 | ① 自签（默认 `www.bing.com`）② ACME Let's Encrypt ③ 自定义路径 |
-| 端口 | 自定义或随机 UDP 端口；可选端口跳跃（iptables DNAT） |
-| 认证 | 密码认证（可随机生成） |
-| 伪装 | `masquerade` 反向代理伪装网站（默认 `www.bing.com`） |
-| 服务管理 | 启动 / 停止 / 重启 |
-| 改配置 | 端口、密码、证书、伪装站 |
-| **更新 Hysteria** | 官方安装器 `--force` 升到最新版，保留现有配置 |
-| **UDP 缓冲优化** | 增大 `rmem/wmem` 等，利于 QUIC 高吞吐；可查看 / 应用 / 移除 |
-| **防火墙自动识别** | 优先 **ufw** → **firewalld** → **iptables**，安装后自动放行 UDP 端口 |
-| 客户端输出 | `/root/hy/hy-client.yaml`、`hy-client.json`、`url.txt`、二维码 |
+| 功能 | 需要 root | 说明 |
+|------|:---------:|------|
+| **交互式安装** | ✅ | 逐步选择证书 / 端口 / 密码 / 伪装 / 端口跳跃 |
+| **一键安装** | ✅ | 全默认：自签 `www.bing.com` + 随机端口/密码 + 伪装 bing |
+| 卸载 | ✅ | 官方 [get.hy2.sh](https://get.hy2.sh/) 卸二进制 + 清配置 |
+| 证书（自签 / ACME / 自定义） | ✅ | 默认自签 `www.bing.com`；ACME 需域名 |
+| 端口 / 端口跳跃 | ✅ | 随机或自定义 UDP；跳跃用 iptables DNAT |
+| 认证密码 | ✅ | 手输或随机 |
+| 伪装站 masquerade | ✅ | 默认 `www.bing.com` |
+| 服务启停重启 | ✅ | systemd `hysteria-server` |
+| 改配置 | ✅ | 端口、密码、证书、伪装站 |
+| **更新 Hysteria** | ✅ | 官方 `--force`，保留配置 |
+| **UDP 缓冲优化** | ✅ | sysctl `rmem/wmem` 等 |
+| **防火墙自动识别** | ✅ | ufw → firewalld → iptables，自动放行 UDP |
+| 客户端输出 | ✅ | `/root/hy/` 下 YAML / JSON / url / 二维码 |
+| 更新本脚本 | ✅ | 写入 `/usr/local/bin/install-hy2` |
 
 ## 菜单
 
