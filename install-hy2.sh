@@ -16,9 +16,12 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # 当通过 curl | bash 运行时，stdin 不是终端；把输入切到 /dev/tty 以支持交互
-# 无 TTY 环境（CI/非交互）失败则忽略，避免脚本直接退出
+# 无可用 TTY 时静默跳过（避免 CI / 非交互环境报错）
 if [[ ! -t 0 ]]; then
-  exec </dev/tty 2>/dev/null || true
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    exec 0<&3
+    exec 3<&-
+  fi
 fi
 
 ### 常量 ###
