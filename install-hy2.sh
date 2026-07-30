@@ -20,7 +20,7 @@ if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 OFFICIAL_INSTALLER="https://get.hy2.sh/"
@@ -840,25 +840,25 @@ do_install() {
   show_conf
 }
 
-# 极速安装：全默认，无逐步询问
+# 一键安装：全默认，不再逐步问证书/端口/密码
 # 自签 www.bing.com + 随机端口 + 随机密码 + 伪装 www.bing.com + 单端口
 do_quick_install() {
   echo
-  green "极速安装将使用以下默认值:"
+  green "一键安装默认参数:"
   echo "  证书: 自签 (SNI=${DEFAULT_SNI})"
   echo "  端口: 随机 UDP（单端口，无跳跃）"
-  echo "  密码: 随机"
+  echo "  密码: 随机生成"
   echo "  伪装: ${DEFAULT_MASQUERADE}"
   echo
   if is_installed; then
     warn "检测到已安装，继续将覆盖现有配置"
-  fi
-  read -rp "确认开始极速安装？[Y/n]: " ans
-  ans="${ans:-Y}"
-  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 0
-
-  if is_installed; then
+    read -rp "确认覆盖并一键重装？[y/N]: " ans
+    [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 0
     clear_port_hop_rules
+  else
+    read -rp "确认开始一键安装？[Y/n]: " ans
+    ans="${ans:-Y}"
+    [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 0
   fi
 
   ensure_deps
@@ -884,7 +884,7 @@ do_quick_install() {
 
   echo
   green "=========================================="
-  green " Hysteria 2 极速安装完成"
+  green " Hysteria 2 一键安装完成"
   green "=========================================="
   show_conf
 }
@@ -1096,38 +1096,73 @@ update_script() {
   fi
 }
 
-### 主菜单 ###
+### 管理子菜单 ###
+menu_manage() {
+  while true; do
+    clear
+    echo "#############################################################"
+    echo -e "#                    ${GREEN}管理功能${PLAIN}                              #"
+    echo "#############################################################"
+    echo
+    echo -e "  ${GREEN}1.${PLAIN} 启动 / 停止 / 重启"
+    echo -e "  ${GREEN}2.${PLAIN} 修改配置（端口/密码/证书/伪装站）"
+    echo -e "  ${GREEN}3.${PLAIN} 显示配置（YAML / JSON / 链接 / 二维码）"
+    echo -e "  ${GREEN}4.${PLAIN} 更新 Hysteria 到最新版"
+    echo -e "  ${GREEN}5.${PLAIN} UDP 缓冲优化"
+    echo -e "  ${GREEN}6.${PLAIN} 更新本脚本"
+    echo -e "  ${RED}7.${PLAIN} 卸载 Hysteria 2"
+    echo -e "  ${GREEN}0.${PLAIN} 返回上级"
+    echo
+    read -rp "请输入选项 [0-7]: " m
+    case "$m" in
+      1) menu_switch; pause ;;
+      2) menu_change; pause ;;
+      3) show_conf; pause ;;
+      4) update_hysteria; pause ;;
+      5) menu_udp_optimize; pause ;;
+      6) update_script; pause ;;
+      7) do_uninstall; pause ;;
+      0) return 0 ;;
+      *) err "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+### 主菜单：先选 交互式 / 一键 ###
 menu() {
   clear
   echo "#############################################################"
-  echo -e "#          ${GREEN}Hysteria 2 一键安装脚本${PLAIN}  v${SCRIPT_VERSION}           #"
+  echo -e "#          ${GREEN}Hysteria 2 安装脚本${PLAIN}  v${SCRIPT_VERSION}                #"
   echo -e "#   ${BLUE}https://github.com/JasonZhangDad/install-hy2-script${PLAIN}  #"
   echo "#############################################################"
   echo
-  echo -e "  ${GREEN}1.${PLAIN} 安装 Hysteria 2（逐步配置）"
-  echo -e "  ${GREEN}2.${PLAIN} 极速安装（全默认：自签 bing + 随机端口/密码）"
-  echo -e "  ${RED}3.${PLAIN} 卸载 Hysteria 2"
+  green "请选择安装模式："
+  echo
+  echo -e "  ${GREEN}1.${PLAIN} 交互式安装"
+  echo -e "      逐步选择：证书类型 / 端口 / 密码 / 伪装站 / 端口跳跃"
+  echo
+  echo -e "  ${GREEN}2.${PLAIN} 一键安装 ${YELLOW}（推荐新手）${PLAIN}"
+  echo -e "      全默认：自签 ${DEFAULT_SNI} + 随机端口 + 随机密码 + 伪装 ${DEFAULT_MASQUERADE}"
+  echo
   echo "  -----------------------------------------------"
-  echo -e "  ${GREEN}4.${PLAIN} 启动 / 停止 / 重启"
-  echo -e "  ${GREEN}5.${PLAIN} 修改配置（端口/密码/证书/伪装站）"
-  echo -e "  ${GREEN}6.${PLAIN} 显示配置（YAML / JSON / 链接 / 二维码）"
-  echo "  -----------------------------------------------"
-  echo -e "  ${GREEN}7.${PLAIN} 更新 Hysteria 到最新版"
-  echo -e "  ${GREEN}8.${PLAIN} UDP 缓冲优化"
-  echo -e "  ${GREEN}9.${PLAIN} 更新本脚本"
+  echo -e "  ${GREEN}3.${PLAIN} 管理功能（启停 / 改配置 / 更新 / 卸载 / UDP 优化）"
   echo -e "  ${GREEN}0.${PLAIN} 退出"
   echo
-  read -rp "请输入选项 [0-9]: " input
+  read -rp "请输入选项 [0-3]: " input
   case "$input" in
-    1) do_install; pause ;;
-    2) do_quick_install; pause ;;
-    3) do_uninstall; pause ;;
-    4) menu_switch; pause ;;
-    5) menu_change; pause ;;
-    6) show_conf; pause ;;
-    7) update_hysteria; pause ;;
-    8) menu_udp_optimize; pause ;;
-    9) update_script; pause ;;
+    1)
+      echo
+      yellow "→ 已选择：交互式安装"
+      do_install
+      pause
+      ;;
+    2)
+      echo
+      yellow "→ 已选择：一键安装"
+      do_quick_install
+      pause
+      ;;
+    3) menu_manage ;;
     0) exit 0 ;;
     *) err "无效选项"; sleep 1 ;;
   esac
@@ -1137,10 +1172,19 @@ main() {
   need_root
   detect_os
 
-  # 非交互快捷参数（可选）
+  # 命令行直接指定模式（跳过主菜单）
   case "${1:-}" in
-    install) do_install; exit 0 ;;
-    quick|install-auto) do_quick_install; exit 0 ;;
+    install|interactive)
+      yellow "模式：交互式安装"
+      do_install
+      exit 0
+      ;;
+    quick|onekey|auto|install-auto)
+      yellow "模式：一键安装"
+      do_quick_install
+      exit 0
+      ;;
+    manage) menu_manage; exit 0 ;;
     uninstall) do_uninstall; exit 0 ;;
     update|update-hy2) update_hysteria; exit 0 ;;
     udp|optimize) menu_udp_optimize; exit 0 ;;
@@ -1149,15 +1193,16 @@ main() {
     help|--help|-h)
       cat <<EOF
 用法:
-  bash install-hy2.sh              交互菜单
-  bash install-hy2.sh install      逐步安装向导
-  bash install-hy2.sh quick        极速安装（全默认）
-  bash install-hy2.sh update       更新 Hysteria 到最新版
-  bash install-hy2.sh udp          UDP 缓冲优化菜单
-  bash install-hy2.sh uninstall    卸载
-  bash install-hy2.sh show         显示配置
+  bash install-hy2.sh                 主菜单（选 交互式 / 一键）
+  bash install-hy2.sh interactive     交互式安装
+  bash install-hy2.sh onekey          一键安装（全默认）
+  bash install-hy2.sh manage          管理菜单
+  bash install-hy2.sh update          更新 Hysteria
+  bash install-hy2.sh udp             UDP 缓冲优化
+  bash install-hy2.sh uninstall       卸载
+  bash install-hy2.sh show            显示配置
 
-推荐一键:
+推荐:
   bash <(curl -fsSL ${REPO_RAW})
 EOF
       exit 0

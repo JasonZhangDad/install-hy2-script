@@ -28,8 +28,9 @@ bash install-hy2.sh
 
 | 功能 | 说明 |
 |------|------|
-| 逐步安装 / 卸载 | 使用官方 [get.hy2.sh](https://get.hy2.sh/) 安装二进制 |
-| **极速安装** | 全默认：自签 `www.bing.com` + 随机端口/密码 + 伪装 bing，几乎只回车 |
+| **交互式安装** | 逐步选择证书 / 端口 / 密码 / 伪装 / 端口跳跃 |
+| **一键安装** | 全默认：自签 `www.bing.com` + 随机端口/密码 + 伪装 bing |
+| 卸载 | 使用官方 [get.hy2.sh](https://get.hy2.sh/) 管理二进制 |
 | 证书 | ① 自签（默认 `www.bing.com`）② ACME Let's Encrypt ③ 自定义路径 |
 | 端口 | 自定义或随机 UDP 端口；可选端口跳跃（iptables DNAT） |
 | 认证 | 密码认证（可随机生成） |
@@ -42,17 +43,26 @@ bash install-hy2.sh
 
 ## 菜单
 
+启动后先选模式：
+
 ```
-1. 安装 Hysteria 2（逐步配置）
-2. 极速安装（全默认：自签 bing + 随机端口/密码）
-3. 卸载 Hysteria 2
-4. 启动 / 停止 / 重启
-5. 修改配置（端口/密码/证书/伪装站）
-6. 显示配置（YAML / JSON / 链接 / 二维码）
-7. 更新 Hysteria 到最新版
-8. UDP 缓冲优化
-9. 更新本脚本
+1. 交互式安装     — 逐步配置证书/端口/密码/伪装/端口跳跃
+2. 一键安装       — 全默认（自签 bing + 随机端口/密码）
+3. 管理功能       — 启停 / 改配置 / 更新 / 卸载 / UDP 优化
 0. 退出
+```
+
+管理功能子菜单：
+
+```
+1. 启动 / 停止 / 重启
+2. 修改配置
+3. 显示配置
+4. 更新 Hysteria 到最新版
+5. UDP 缓冲优化
+6. 更新本脚本
+7. 卸载 Hysteria 2
+0. 返回
 ```
 
 ## 支持系统
@@ -83,13 +93,14 @@ bash install-hy2.sh
 ## 命令行快捷参数
 
 ```bash
-bash install-hy2.sh install     # 逐步安装向导
-bash install-hy2.sh quick       # 极速安装（全默认）
-bash install-hy2.sh update      # 更新 Hysteria 到最新版
-bash install-hy2.sh udp         # UDP 缓冲优化菜单
-bash install-hy2.sh uninstall   # 卸载
-bash install-hy2.sh show        # 显示配置
-bash install-hy2.sh version
+bash install-hy2.sh                 # 主菜单：选 交互式 / 一键
+bash install-hy2.sh interactive     # 直接进交互式安装
+bash install-hy2.sh onekey          # 直接进一键安装
+bash install-hy2.sh manage          # 管理菜单
+bash install-hy2.sh update          # 更新 Hysteria
+bash install-hy2.sh udp             # UDP 缓冲优化
+bash install-hy2.sh uninstall       # 卸载
+bash install-hy2.sh show            # 显示配置
 ```
 
 ### UDP 优化说明
