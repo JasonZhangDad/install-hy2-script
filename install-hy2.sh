@@ -78,6 +78,18 @@ pause() {
   read -rp "按回车返回菜单..." _
 }
 
+# 需要交互输入的入口才强制 TTY。没有 TTY 又要 read 的话，
+# read 在 set -e 下会让脚本静默退出（exit 1，无任何提示），所以提前报错。
+# 只读子命令（show / link / check / repair）不走这里 —— 它们要能在
+# cron、CI、重定向到日志的场景下正常跑。
+require_tty() {
+  [[ -t 0 ]] && return 0
+  err "该操作需要交互输入，但未检测到可交互终端：stdin 不是 TTY，且 /dev/tty 不可用。"
+  err "请在 SSH 终端中运行，推荐: bash <(curl -fsSL \"${REPO_RAW}?t=\$(date +%s)\")"
+  err "无需交互的子命令: show / link / check / repair"
+  exit 1
+}
+
 # 是否为磁盘上的真实脚本路径（排除 /dev/fd、进程替换等）
 _is_real_script_path() {
   local p="${1:-}"
@@ -2144,6 +2156,10 @@ install-hy2-script v${SCRIPT_VERSION}
   bash install-hy2.sh show            显示配置
   bash install-hy2.sh link            查看分享链接 / 二维码
   bash install-hy2.sh check           连通性自检
+  bash install-hy2.sh repair          修复权限并启动
+
+其中 show / link / check / repair 不需要交互，可在 cron 或重定向到日志时使用；
+其余子命令需要可交互终端。
 
 推荐运行（root）:
   bash <(curl -fsSL "${REPO_RAW}?t=\$(date +%s)")
@@ -2156,14 +2172,6 @@ EOF
       ;;
   esac
 
-  # 本脚本全程需要交互输入。没有可用 TTY 时提前报错，
-  # 否则 read 在 set -e 下会让脚本静默退出（exit 1，无任何提示）
-  if [[ ! -t 0 ]]; then
-    err "未检测到可交互终端：stdin 不是 TTY，且 /dev/tty 不可用。"
-    err "请在 SSH 终端中运行，推荐: bash <(curl -fsSL \"${REPO_RAW}?t=\$(date +%s)\")"
-    exit 1
-  fi
-
   # 强制 root（非 root 自动 sudo 重跑）
   need_root "$@"
   green "[OK] root 权限检查通过 (uid=$(id -u) user=$(id -un))"
@@ -2171,25 +2179,28 @@ EOF
 
   case "${1:-}" in
     install|interactive)
+      require_tty
       yellow "模式：交互式安装"
       do_install
       exit 0
       ;;
     quick|onekey|auto|install-auto)
+      require_tty
       yellow "模式：一键安装"
       do_quick_install
       exit 0
       ;;
-    manage) menu_manage; exit 0 ;;
+    manage) require_tty; menu_manage; exit 0 ;;
     repair|fix) repair_and_start; exit 0 ;;
-    uninstall) do_uninstall; exit 0 ;;
-    update|update-hy2) update_hysteria; exit 0 ;;
-    udp|optimize) menu_udp_optimize; exit 0 ;;
+    uninstall) require_tty; do_uninstall; exit 0 ;;
+    update|update-hy2) require_tty; update_hysteria; exit 0 ;;
+    udp|optimize) require_tty; menu_udp_optimize; exit 0 ;;
     show) show_conf; exit 0 ;;
     link|url|qr) show_link; exit 0 ;;
     check|diag|diagnose) diagnose_connectivity; exit 0 ;;
   esac
 
+  require_tty
   while true; do
     menu
   done
