@@ -634,10 +634,19 @@ install_acme_cert() {
   local cert="${HY_DIR}/cert.crt"
   local key="${HY_DIR}/private.key"
   mkdir -p "$HY_DIR"
+
+  # acme.sh 以 root 续期，会把这两个文件重写成 root:root 600。
+  # 服务以 hysteria 用户跑，只 restart 的话续期后必然启动失败（约 60 天后爆炸），
+  # 所以 reloadcmd 里必须先补回属主和权限。用户名在申请时就固定下来，
+  # 因为续期时脚本本身可能已经不在磁盘上了。
+  local hy_user
+  hy_user="$(get_hy_user)"
+  local reload_cmd="chown ${hy_user}:${hy_user} '${cert}' '${key}' 2>/dev/null || true; chmod 644 '${cert}' 2>/dev/null || true; chmod 600 '${key}' 2>/dev/null || true; systemctl restart ${SERVICE_NAME}.service 2>/dev/null || true"
+
   $acme --install-cert -d "$domain" --ecc \
     --fullchain-file "$cert" \
     --key-file "$key" \
-    --reloadcmd "systemctl restart ${SERVICE_NAME}.service 2>/dev/null || true" \
+    --reloadcmd "$reload_cmd" \
     || die "证书安装失败"
 
   CERT_PATH="$cert"
