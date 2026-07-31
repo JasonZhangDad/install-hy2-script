@@ -617,7 +617,33 @@ install_acme_cert() {
     [[ "${cont,,}" == "y" || "${cont,,}" == "yes" ]] || die "已取消"
   fi
 
-  # ACME HTTP-01 需要 80/tcp：按当前防火墙自动放行
+  # ACME HTTP-01 需要 80/tcp，但 hysteria 本身不用 80，申请完就该收回。
+  # 只有一个坑：acme.sh 续期同样走 standalone，80 关着会续期失败。
+  # 所以把「开 80 / 关 80」做成 pre-hook / post-hook 存进域名配置，
+  # 续期时由 acme.sh 自己临时开关。hook 必须是自包含命令 —— 续期时本脚本可能已不在磁盘上。
+  local had_tcp80=0
+  if is_firewall_tcp_open 80; then
+    had_tcp80=1
+  fi
+
+  local pre_hook="" post_hook=""
+  if [[ $had_tcp80 -eq 0 ]]; then
+    case "$(detect_firewall)" in
+      ufw)
+        pre_hook="ufw allow 80/tcp >/dev/null 2>&1 || true"
+        post_hook="ufw delete allow 80/tcp >/dev/null 2>&1 || true"
+        ;;
+      firewalld)
+        pre_hook="firewall-cmd --add-port=80/tcp >/dev/null 2>&1 || true"
+        post_hook="firewall-cmd --remove-port=80/tcp >/dev/null 2>&1 || true"
+        ;;
+      iptables)
+        pre_hook="iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true"
+        post_hook="iptables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true"
+        ;;
+    esac
+  fi
+
   info "为 ACME 申请证书，自动放行 TCP 80..."
   open_firewall_tcp 80
 
@@ -626,7 +652,21 @@ install_acme_cert() {
   if [[ "$ip" == *:* ]]; then
     issue_args+=(--listen-v6)
   fi
-  if ! $acme --issue "${issue_args[@]}"; then
+  # hook 为空（未知防火墙 / 80 本来就开着）时不传，避免把空字符串写进域名配置
+  if [[ -n "$pre_hook" ]]; then
+    issue_args+=(--pre-hook "$pre_hook" --post-hook "$post_hook")
+  fi
+
+  # 申请失败也要收回 80，不能因为 die 就把端口留在外面
+  local issue_rc=0
+  $acme --issue "${issue_args[@]}" || issue_rc=$?
+  if [[ $had_tcp80 -eq 0 ]]; then
+    close_firewall_tcp 80
+    if [[ -n "$post_hook" ]]; then
+      info "续期时将自动临时放行 TCP 80（已写入 acme.sh hook）"
+    fi
+  fi
+  if [[ $issue_rc -ne 0 ]]; then
     die "证书申请失败。请确认: 1) 域名已解析到本机 2) 80 端口可达 3) 防火墙已放行 80/tcp"
   fi
 
@@ -1304,6 +1344,41 @@ persist_iptables() {
     iptables-save >/etc/iptables/rules.v4 2>/dev/null && return 0
   fi
   return 1
+}
+
+# TCP 端口当前是否已放行。0=已放行 1=未放行/无防火墙
+# 用于 ACME 借用 80 端口：本来就开着就别在申请完把人家关掉
+is_firewall_tcp_open() {
+  local tport="$1"
+  case "$(detect_firewall)" in
+    ufw)       ufw status 2>/dev/null | grep -qE "^${tport}/tcp\b" ;;
+    firewalld) firewall-cmd --list-ports 2>/dev/null | grep -qw "${tport}/tcp" ;;
+    iptables)  iptables -S INPUT 2>/dev/null | grep -qE -- "-p tcp .*--dport ${tport} -j ACCEPT" ;;
+    *)         return 1 ;;
+  esac
+}
+
+# 撤销 open_firewall_tcp 放行的端口
+close_firewall_tcp() {
+  local tport="$1"
+  case "$(detect_firewall)" in
+    ufw)
+      ufw delete allow "${tport}/tcp" >/dev/null 2>&1 || true
+      ufw reload >/dev/null 2>&1 || true
+      green "ufw 已收回 TCP ${tport}"
+      ;;
+    firewalld)
+      firewall-cmd --permanent --remove-port="${tport}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      green "firewalld 已收回 TCP ${tport}"
+      ;;
+    iptables)
+      iptables -D INPUT -p tcp --dport "$tport" -j ACCEPT 2>/dev/null || true
+      persist_iptables || true
+      green "iptables 已收回 TCP ${tport}"
+      ;;
+    *) ;;
+  esac
 }
 
 # 仅放行 TCP 端口（ACME 80 等）
