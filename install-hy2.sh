@@ -25,7 +25,7 @@ if [[ ! -t 0 ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 # raw.githubusercontent.com 有约 5 分钟 CDN 缓存，自更新/提权重下时必须绕开，
@@ -314,15 +314,18 @@ format_host() {
 
 ### meta 读写（避免 sed 行号踩坑）###
 meta_set() {
-  local key="$1" value="$2"
+  local key="$1" value="$2" tmp
   mkdir -p "$HY_DIR"
   touch "$HY_META"
-  if grep -qE "^${key}=" "$HY_META" 2>/dev/null; then
-    # 使用 | 分隔避免路径中 / 冲突
-    sed -i.bak "s|^${key}=.*|${key}=${value}|" "$HY_META" && rm -f "${HY_META}.bak"
-  else
-    echo "${key}=${value}" >>"$HY_META"
-  fi
+  chmod 600 "$HY_META" 2>/dev/null || true
+  # 不用 sed：value 是密码等任意内容，含 | 会破坏替换表达式并留下带密码的 .bak
+  # 改为「过滤旧行 + 追加新行 + 原子替换」，对任何字符都安全
+  tmp="$(mktemp "${HY_DIR}/.meta.XXXXXX")"
+  chmod 600 "$tmp"
+  grep -vE "^${key}=" "$HY_META" >"$tmp" 2>/dev/null || true
+  printf '%s=%s\n' "$key" "$value" >>"$tmp"
+  mv -f "$tmp" "$HY_META"
+  chmod 600 "$HY_META" 2>/dev/null || true
 }
 
 meta_get() {
@@ -415,11 +418,8 @@ fix_hy_permissions() {
 
   relocate_certs_if_needed
 
-  # 目录内所有相关文件
-  if [[ -f "$HY_CONF" ]]; then
-    # 属主可读即可；先给 644 再 chown，避免中间状态
-    chmod 644 "$HY_CONF" || true
-  fi
+  # config / meta 含明文密码，只给属主读（chown 到运行用户后 600 依然读得到）；
+  # 证书公钥本就是公开信息，644 无妨；私钥 600。
   if [[ -f "${HY_DIR}/cert.crt" ]]; then
     chmod 644 "${HY_DIR}/cert.crt" || true
   fi
@@ -440,19 +440,14 @@ fix_hy_permissions() {
     fi
     if id "$user" >/dev/null 2>&1; then
       chown -R "${user}:${user}" "$HY_DIR" || err "chown ${HY_DIR} 失败"
-      # 配置必须归 hysteria 且可读
-      if [[ -f "$HY_CONF" ]]; then
-        chown "${user}:${user}" "$HY_CONF"
-        chmod 644 "$HY_CONF"
-      fi
     else
-      # 极端情况：没有 hysteria 用户，放宽权限让任何用户可读配置（仅兜底）
-      warn "无 hysteria 用户，将 config 设为 644 兜底"
-      [[ -f "$HY_CONF" ]] && chmod 644 "$HY_CONF"
+      warn "无 hysteria 用户，config 保持 root 属主"
     fi
-  else
-    [[ -f "$HY_CONF" ]] && chmod 644 "$HY_CONF"
   fi
+
+  # chown 之后再收权限，确保属主已经是运行用户
+  [[ -f "$HY_CONF" ]] && { chmod 600 "$HY_CONF" || true; }
+  [[ -f "$HY_META" ]] && { chmod 600 "$HY_META" || true; }
 
   info "权限已设置（运行用户: ${user}） ls:"
   ls -la "$HY_DIR" 2>/dev/null || true
@@ -480,18 +475,30 @@ ensure_config_readable() {
     return 0
   fi
 
-  # 二次强制修复
+  # 二次强制修复。注意不碰 /etc 自身权限——那是整机安全基线，
+  # 修 hysteria 的配置没有任何理由放宽它
   warn "配置对 ${user} 仍不可读，强制修复..."
-  chmod 755 /etc 2>/dev/null || true
   chmod 755 "$HY_DIR"
-  chown "${user}:${user}" "$HY_CONF"
-  chmod 644 "$HY_CONF"
   chown -R "${user}:${user}" "$HY_DIR"
+  chown "${user}:${user}" "$HY_CONF"
+  chmod 600 "$HY_CONF"
 
   rc=0
   can_user_read "$user" "$HY_CONF" || rc=$?
   if [[ $rc -eq 0 ]]; then
     green "[OK] 强制修复后 config 可读"
+    return 0
+  fi
+
+  # 还不行就按 600 -> 640 降一级（属组给运行用户）。
+  # 不降到 644：config 含明文密码，全局可读等于泄露
+  warn "600 仍不可读，降级为 640 (root:${user})"
+  chown "root:${user}" "$HY_CONF" 2>/dev/null || true
+  chmod 640 "$HY_CONF" 2>/dev/null || true
+  rc=0
+  can_user_read "$user" "$HY_CONF" || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    green "[OK] 降级 640 后 config 可读"
     return 0
   fi
 
@@ -729,21 +736,37 @@ choose_port() {
   fi
 }
 
+# 密码会同时进 YAML 配置和分享链接 URL，限制为 URL unreserved 字符集，
+# 否则 ": " 会让 YAML 解析失败、"*" 会被当成 alias、"|" 会破坏 meta 写入
+validate_password() {
+  local p="$1"
+  [[ "$p" =~ ^[A-Za-z0-9._~-]{1,128}$ ]]
+}
+
 choose_password() {
   echo
-  read -rp "设置连接密码（回车随机）: " AUTH_PWD
-  AUTH_PWD="${AUTH_PWD:-$(rand_pwd)}"
+  while true; do
+    read -rp "设置连接密码（回车随机，限字母数字与 . _ ~ -）: " AUTH_PWD
+    AUTH_PWD="${AUTH_PWD:-$(rand_pwd)}"
+    validate_password "$AUTH_PWD" && break
+    err "密码含不支持的字符（会破坏 YAML 配置与分享链接），请只用字母、数字和 . _ ~ -"
+  done
   yellow "密码: $AUTH_PWD"
 }
 
 choose_masquerade() {
   echo
-  read -rp "伪装网站（去掉 https://，回车默认 ${DEFAULT_MASQUERADE}）: " PROXY_SITE
-  PROXY_SITE="${PROXY_SITE:-$DEFAULT_MASQUERADE}"
-  # 去掉协议和路径
-  PROXY_SITE="${PROXY_SITE#https://}"
-  PROXY_SITE="${PROXY_SITE#http://}"
-  PROXY_SITE="${PROXY_SITE%%/*}"
+  while true; do
+    read -rp "伪装网站（去掉 https://，回车默认 ${DEFAULT_MASQUERADE}）: " PROXY_SITE
+    PROXY_SITE="${PROXY_SITE:-$DEFAULT_MASQUERADE}"
+    # 去掉协议和路径
+    PROXY_SITE="${PROXY_SITE#https://}"
+    PROXY_SITE="${PROXY_SITE#http://}"
+    PROXY_SITE="${PROXY_SITE%%/*}"
+    # 未校验的值直接拼进 YAML 的 url 字段，含空格/冒号会写坏配置
+    validate_domain "$PROXY_SITE" && break
+    err "伪装站域名格式不合法: ${PROXY_SITE}"
+  done
   yellow "伪装站: $PROXY_SITE"
 }
 
@@ -856,6 +879,8 @@ write_client_files() {
   fi
 
   mkdir -p "$CLIENT_DIR"
+  # 目录内每个文件都含密码；/root 通常已是 700，这里再收一道
+  chmod 700 "$CLIENT_DIR" 2>/dev/null || true
 
   # 带宽片段：设了才写，写了就是 Brutal，不写是 BBR
   local bw_yaml="" bw_json="" bw_url="" bw_clash="" bw_sing=""
@@ -972,6 +997,10 @@ EOF
   }
 }
 EOF
+
+  chmod 600 "${CLIENT_DIR}"/hy-client.yaml "${CLIENT_DIR}"/hy-client.json \
+            "${CLIENT_DIR}"/clash-meta.yaml "${CLIENT_DIR}"/sing-box.json \
+            "${CLIENT_DIR}"/url.txt 2>/dev/null || true
 
   # 二维码
   if command -v qrencode >/dev/null 2>&1; then
@@ -1456,10 +1485,14 @@ do_uninstall() {
   clear_port_hop_rules
 
   # 用官方脚本删二进制和 unit（保留我们自己的配置目录手动清理）
-  if curl -fsSL "$OFFICIAL_INSTALLER" -o /tmp/get-hy2.sh 2>/dev/null; then
-    bash /tmp/get-hy2.sh --remove 2>/dev/null || true
-    rm -f /tmp/get-hy2.sh
+  # 固定路径 + root 执行会被本地用户抢跑（软链/预置文件），必须用随机名
+  local rm_tmp
+  rm_tmp="$(mktemp /tmp/get-hy2.XXXXXXXX)"
+  chmod 700 "$rm_tmp"
+  if curl -fsSL "$OFFICIAL_INSTALLER" -o "$rm_tmp" 2>/dev/null; then
+    bash "$rm_tmp" --remove 2>/dev/null || true
   fi
+  rm -f "$rm_tmp"
 
   rm -rf "$HY_DIR" "$CLIENT_DIR"
   rm -f /root/hy2-cert/cert.crt /root/hy2-cert/private.key 2>/dev/null || true

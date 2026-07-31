@@ -126,9 +126,10 @@ ACME 申请证书时会额外按同一逻辑放行 **TCP 80**。
 | 路径 | 说明 |
 |------|------|
 | `/usr/local/bin/hysteria` | 主程序 |
-| `/etc/hysteria/config.yaml` | 服务端配置 |
-| `/etc/hysteria/install.meta` | 安装元数据（改配置用） |
+| `/etc/hysteria/config.yaml` | 服务端配置（`600`，含明文密码） |
+| `/etc/hysteria/install.meta` | 安装元数据（`600`，含明文密码） |
 | `/etc/hysteria/cert.crt` / `private.key` | 自签证书（默认） |
+| `/root/hy/` | 客户端目录（`700`，内含密码的文件均为 `600`） |
 | `/root/hy/hy-client.yaml` / `.json` | Hysteria 官方客户端配置 |
 | `/root/hy/clash-meta.yaml` | Clash Meta / mihomo 片段 |
 | `/root/hy/sing-box.json` | sing-box outbound 片段 |
@@ -197,6 +198,16 @@ hysteria2://PASSWORD@SERVER_IP:PORT/?insecure=1&sni=www.bing.com#Hysteria2
 - ACME 真证书默认 `insecure=0`
 - 端口跳跃时附加 `mport=起始-结束`
 - 启用 Brutal 时附加 `upmbps=10&downmbps=30`（多数客户端可识别）
+
+## 安全说明
+
+- 含明文密码的文件（`config.yaml`、`install.meta`、`/root/hy/*`）一律 `600`，
+  目录 `700`，**不会让同机其它本地用户读到节点密码**
+- 服务以 `User=hysteria` 运行时，配置会 `chown` 给该用户，属主 `600` 即可读；
+  极端环境下会自动降级到 `640 (root:hysteria)`，**不会降到全局可读的 644**
+- 密码限制为 `A-Za-z0-9._~-`：这些字符在 YAML 和 URL 中均无歧义，
+  避免 `: ` 写坏配置、`*` 被当成 YAML alias
+- 脚本下载临时文件一律使用 `mktemp` 随机名，避免 `/tmp` 下的软链抢占
 
 ## 说明
 
