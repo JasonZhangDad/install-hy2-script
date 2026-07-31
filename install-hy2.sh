@@ -25,7 +25,7 @@ if [[ ! -t 0 ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 # raw.githubusercontent.com 有约 5 分钟 CDN 缓存，自更新/提权重下时必须绕开，
@@ -419,6 +419,9 @@ fix_hy_permissions() {
   chmod 755 "$HY_DIR" || true
 
   relocate_certs_if_needed
+
+  # 清掉历史 sed -i.bak 残留：那是一份旧 config 副本，含旧密码且通常是 644
+  rm -f "${HY_DIR}"/*.bak 2>/dev/null || true
 
   # config / meta 含明文密码，只给属主读（chown 到运行用户后 600 依然读得到）；
   # 证书公钥本就是公开信息，644 无妨；私钥 600。
