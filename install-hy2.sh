@@ -25,9 +25,12 @@ if [[ ! -t 0 ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.3.4"
+SCRIPT_VERSION="1.4.0"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
+# raw.githubusercontent.com 有约 5 分钟 CDN 缓存，自更新/提权重下时必须绕开，
+# 否则刚推的新版拉不到。用法: curl -fsSL "$(nocache_url)"
+nocache_url() { echo "${REPO_RAW}?t=$(date +%s)"; }
 OFFICIAL_INSTALLER="https://get.hy2.sh/"
 HY_BIN="/usr/local/bin/hysteria"
 HY_DIR="/etc/hysteria"
@@ -96,13 +99,13 @@ need_root() {
 
   if [[ "${HY2_ROOT_REEXEC:-}" == "1" ]]; then
     err "已尝试 sudo 提权，但仍不是 root。请手动执行："
-    err "  curl -fsSL ${REPO_RAW} | sudo bash"
+    err "  curl -fsSL \"${REPO_RAW}?t=\$(date +%s)\" | sudo bash"
     exit 1
   fi
 
   if ! command -v sudo >/dev/null 2>&1; then
     err "本脚本必须使用 root 权限运行，且系统未找到 sudo。"
-    err "请切换 root 后执行: bash <(curl -fsSL ${REPO_RAW})"
+    err "请切换 root 后执行: bash <(curl -fsSL \"${REPO_RAW}?t=\$(date +%s)\")"
     exit 1
   fi
 
@@ -121,7 +124,7 @@ need_root() {
   # shellcheck disable=SC2064
   trap "rm -f '$tmp'" EXIT
 
-  if command -v curl >/dev/null 2>&1 && curl -fsSL "$REPO_RAW" -o "$tmp" 2>/dev/null; then
+  if command -v curl >/dev/null 2>&1 && curl -fsSL "$(nocache_url)" -o "$tmp" 2>/dev/null; then
     chmod 700 "$tmp"
     trap - EXIT
     exec sudo -E env HY2_ROOT_REEXEC=1 bash "$tmp" "$@"
@@ -138,8 +141,8 @@ need_root() {
   trap - EXIT
   err "无法自动提权。请用 root 运行，任选其一："
   err "  sudo -i"
-  err "  bash <(curl -fsSL ${REPO_RAW})"
-  err "  curl -fsSL ${REPO_RAW} | sudo bash"
+  err "  bash <(curl -fsSL \"${REPO_RAW}?t=\$(date +%s)\")"
+  err "  curl -fsSL \"${REPO_RAW}?t=\$(date +%s)\" | sudo bash"
   exit 1
 }
 
@@ -744,6 +747,37 @@ choose_masquerade() {
   yellow "伪装站: $PROXY_SITE"
 }
 
+### 带宽 / 拥塞控制 ###
+# 不设 bandwidth -> hysteria2 用 BBR（自适应，丢包时退让）
+# 设了 bandwidth -> 切 Brutal（固定速率，无视丢包），跨境高丢包线路上明显更稳
+validate_mbps() {
+  local v="$1"
+  [[ "$v" =~ ^[0-9]+$ ]] && ((v >= 1 && v <= 10000))
+}
+
+choose_bandwidth() {
+  section "带宽 / 拥塞控制"
+  echo -e "  ${GREEN}留空${PLAIN}  BBR    自适应，丢包时退让 ${YELLOW}（默认，适合优质线路）${PLAIN}"
+  echo -e "  ${GREEN}填写${PLAIN}  Brutal 固定速率，无视丢包 ${YELLOW}（适合跨境高丢包线路）${PLAIN}"
+  echo
+  yellow "填你本地宽带的真实速率，并往下调 10~20%（填太高会自伤式丢包，比不填更差）"
+  echo
+
+  read -rp "下行带宽 Mbps（回车 = 不启用 / 关闭 Brutal，回到 BBR）: " BW_DOWN
+  if [[ -z "$BW_DOWN" ]]; then
+    BW_UP=""
+    yellow "拥塞控制: BBR（未设置带宽）"
+    return 0
+  fi
+  validate_mbps "$BW_DOWN" || die "下行带宽不合法（1-10000 的整数）: $BW_DOWN"
+
+  read -rp "上行带宽 Mbps: " BW_UP
+  [[ -n "$BW_UP" ]] || die "已填下行带宽，上行也必须填"
+  validate_mbps "$BW_UP" || die "上行带宽不合法（1-10000 的整数）: $BW_UP"
+
+  green "拥塞控制: Brutal（上行 ${BW_UP} Mbps / 下行 ${BW_DOWN} Mbps）"
+}
+
 ### 写配置 ###
 write_server_config() {
   mkdir -p "$HY_DIR"
@@ -786,6 +820,18 @@ masquerade:
     url: https://${PROXY_SITE}
     rewriteHost: true
 EOF
+
+  # 设了带宽才写 bandwidth（写了就是 Brutal，不写是 BBR）
+  # 服务器上传对应客户端下行，所以这里 up/down 与客户端相反
+  if [[ -n "${BW_DOWN:-}" && -n "${BW_UP:-}" ]]; then
+    cat >>"$HY_CONF" <<EOF
+
+bandwidth:
+  up: ${BW_DOWN} mbps
+  down: ${BW_UP} mbps
+EOF
+  fi
+
   # 关键：chown 给 hysteria，禁止 root-only 600
   ensure_config_readable
 }
@@ -811,6 +857,29 @@ write_client_files() {
 
   mkdir -p "$CLIENT_DIR"
 
+  # 带宽片段：设了才写，写了就是 Brutal，不写是 BBR
+  local bw_yaml="" bw_json="" bw_url="" bw_clash="" bw_sing=""
+  if [[ -n "${BW_UP:-}" && -n "${BW_DOWN:-}" ]]; then
+    bw_yaml="
+bandwidth:
+  up: ${BW_UP} mbps
+  down: ${BW_DOWN} mbps
+"
+    bw_json="
+  \"bandwidth\": {
+    \"up\": \"${BW_UP} mbps\",
+    \"down\": \"${BW_DOWN} mbps\"
+  },"
+    # 多数客户端（NekoBox/Shadowrocket 等）沿用 hysteria1 的这两个参数名
+    bw_url="&upmbps=${BW_UP}&downmbps=${BW_DOWN}"
+    bw_clash="
+    up: \"${BW_UP} Mbps\"
+    down: \"${BW_DOWN} Mbps\""
+    bw_sing="
+  \"up_mbps\": ${BW_UP},
+  \"down_mbps\": ${BW_DOWN},"
+  fi
+
   cat >"${CLIENT_DIR}/hy-client.yaml" <<EOF
 server: ${host}:${LAST_PORT}
 
@@ -819,7 +888,7 @@ auth: ${AUTH_PWD}
 tls:
   sni: ${HY_DOMAIN}
   insecure: ${insecure_yaml}
-
+${bw_yaml}
 quic:
   initStreamReceiveWindow: 16777216
   maxStreamReceiveWindow: 16777216
@@ -852,7 +921,7 @@ EOF
     "maxStreamReceiveWindow": 16777216,
     "initConnReceiveWindow": 33554432,
     "maxConnReceiveWindow": 33554432
-  },
+  },${bw_json}
   "fastOpen": true,
   "socks5": {
     "listen": "127.0.0.1:5678"
@@ -869,12 +938,40 @@ EOF
 EOF
 
   local remark="Hysteria2"
-  local url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${insecure_url}&sni=${HY_DOMAIN}#${remark}"
+  local url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${insecure_url}&sni=${HY_DOMAIN}${bw_url}#${remark}"
   # 端口跳跃时，分享链接主端口仍用主 listen 端口；跳跃范围写在备注
   if [[ -n "${HOP_FIRST:-}" && -n "${HOP_LAST:-}" ]]; then
-    url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${insecure_url}&sni=${HY_DOMAIN}&mport=${HOP_FIRST}-${HOP_LAST}#${remark}"
+    url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${insecure_url}&sni=${HY_DOMAIN}&mport=${HOP_FIRST}-${HOP_LAST}${bw_url}#${remark}"
   fi
   echo "$url" >"${CLIENT_DIR}/url.txt"
+
+  # Clash Meta / mihomo 片段
+  cat >"${CLIENT_DIR}/clash-meta.yaml" <<EOF
+proxies:
+  - name: "${remark}"
+    type: hysteria2
+    server: ${ip}
+    port: ${PORT}
+    password: ${AUTH_PWD}
+    sni: ${HY_DOMAIN}
+    skip-cert-verify: ${insecure_yaml}${bw_clash}
+EOF
+
+  # sing-box outbound 片段
+  cat >"${CLIENT_DIR}/sing-box.json" <<EOF
+{
+  "type": "hysteria2",
+  "tag": "${remark}",
+  "server": "${ip}",
+  "server_port": ${PORT},
+  "password": "${AUTH_PWD}",${bw_sing}
+  "tls": {
+    "enabled": true,
+    "server_name": "${HY_DOMAIN}",
+    "insecure": ${insecure_json}
+  }
+}
+EOF
 
   # 二维码
   if command -v qrencode >/dev/null 2>&1; then
@@ -894,6 +991,8 @@ EOF
   meta_set insecure "$CLIENT_INSECURE"
   meta_set masquerade "$PROXY_SITE"
   meta_set public_ip "$ip"
+  meta_set bw_up "${BW_UP:-}"
+  meta_set bw_down "${BW_DOWN:-}"
   if [[ -n "${HOP_FIRST:-}" ]]; then
     meta_set hop_first "$HOP_FIRST"
     meta_set hop_last "$HOP_LAST"
@@ -1403,6 +1502,8 @@ load_from_meta() {
   PROXY_SITE="$(meta_get masquerade "$DEFAULT_MASQUERADE")"
   HOP_FIRST="$(meta_get hop_first)"
   HOP_LAST="$(meta_get hop_last)"
+  BW_UP="$(meta_get bw_up)"
+  BW_DOWN="$(meta_get bw_down)"
 }
 
 ### 修改配置 ###
@@ -1453,6 +1554,22 @@ change_masquerade() {
   show_conf
 }
 
+change_bandwidth() {
+  is_installed || die "尚未安装"
+  load_from_meta
+  if [[ -n "${BW_UP:-}" && -n "${BW_DOWN:-}" ]]; then
+    yellow "当前: Brutal（上行 ${BW_UP} Mbps / 下行 ${BW_DOWN} Mbps）"
+  else
+    yellow "当前: BBR（未设置带宽）"
+  fi
+  choose_bandwidth
+  write_server_config
+  write_client_files
+  service_restart
+  green "带宽已更新"
+  show_conf
+}
+
 menu_change() {
   is_installed || { err "尚未安装"; return 0; }
   section "修改配置"
@@ -1460,14 +1577,16 @@ menu_change() {
   item 2 "修改密码"
   item 3 "修改证书"
   item 4 "修改伪装网站"
+  item 5 "带宽 / 加速（Brutal ${YELLOW}可选${PLAIN}，默认 BBR）"
   item 0 "返回"
   echo
-  read -rp "请选择 [0-4]: " c
+  read -rp "请选择 [0-5]: " c
   case "$c" in
     1) change_port ;;
     2) change_password ;;
     3) change_cert ;;
     4) change_masquerade ;;
+    5) change_bandwidth ;;
     *) ;;
   esac
 }
@@ -1519,6 +1638,13 @@ show_conf() {
 
   echo
   yellow "客户端文件目录: ${CLIENT_DIR}/"
+  yellow "  Clash Meta / mihomo : ${CLIENT_DIR}/clash-meta.yaml"
+  yellow "  sing-box outbound   : ${CLIENT_DIR}/sing-box.json"
+  if [[ -n "$(meta_get bw_up)" ]]; then
+    green "拥塞控制: Brutal（上行 $(meta_get bw_up) / 下行 $(meta_get bw_down) Mbps）"
+  else
+    yellow "拥塞控制: BBR（未启用 Brutal，可在 管理→修改配置→5 开启）"
+  fi
   if systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
     green "服务状态: active (running)"
   else
@@ -1530,7 +1656,7 @@ update_script() {
   info "从 GitHub 拉取最新脚本..."
   local tmp
   tmp="$(mktemp)"
-  if curl -fsSL "$REPO_RAW" -o "$tmp"; then
+  if curl -fsSL "$(nocache_url)" -o "$tmp"; then
     local target="/usr/local/bin/install-hy2"
     cp "$tmp" "$target"
     chmod +x "$target"
@@ -1648,10 +1774,10 @@ install-hy2-script v${SCRIPT_VERSION}
   bash install-hy2.sh show            显示配置
 
 推荐运行（root）:
-  bash <(curl -fsSL ${REPO_RAW})
+  bash <(curl -fsSL "${REPO_RAW}?t=\$(date +%s)")
 
 非 root 请用 sudo（脚本也会尝试自动 sudo）:
-  curl -fsSL ${REPO_RAW} | sudo bash
+  curl -fsSL "${REPO_RAW}?t=\$(date +%s)" | sudo bash
   sudo bash install-hy2.sh
 EOF
       exit 0
@@ -1662,7 +1788,7 @@ EOF
   # 否则 read 在 set -e 下会让脚本静默退出（exit 1，无任何提示）
   if [[ ! -t 0 ]]; then
     err "未检测到可交互终端：stdin 不是 TTY，且 /dev/tty 不可用。"
-    err "请在 SSH 终端中运行，推荐: bash <(curl -fsSL ${REPO_RAW})"
+    err "请在 SSH 终端中运行，推荐: bash <(curl -fsSL \"${REPO_RAW}?t=\$(date +%s)\")"
     exit 1
   fi
 

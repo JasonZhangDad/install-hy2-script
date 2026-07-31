@@ -14,8 +14,8 @@ Hysteria 2（hy2）一键安装脚本：交互菜单、多系统支持、自签 
 
 | 方式 | 命令 |
 |------|------|
-| 已是 root | `bash <(curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh)` |
-| 普通用户（推荐） | `curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh \| sudo bash` |
+| 已是 root | `bash <(curl -fsSL "https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh?t=$(date +%s)")` |
+| 普通用户（推荐） | `curl -fsSL "https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh?t=$(date +%s)" \| sudo bash` |
 | 先提权 | `sudo -i` 后再执行脚本 |
 | 本地文件 | `sudo bash install-hy2.sh` |
 
@@ -23,18 +23,21 @@ Hysteria 2（hy2）一键安装脚本：交互菜单、多系统支持、自签 
 
 ```bash
 # root
-bash <(curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh)
+bash <(curl -fsSL "https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh?t=$(date +%s)")
 
 # 非 root（推荐写法）
-curl -fsSL https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh | sudo bash
+curl -fsSL "https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh?t=$(date +%s)" | sudo bash
 ```
 
-> 脚本会在 `curl | bash` 时自动从 `/dev/tty` 读取交互输入。若环境无 TTY，请先下载再执行。
+> 命令里的 `?t=$(date +%s)` 是**防 CDN 缓存**：`raw.githubusercontent.com` 有约 5 分钟缓存，
+> 不加参数可能拉到旧版本。脚本的「更新本脚本」和自动提权重下也都已内置该处理。
+
+> 脚本会在 `curl | bash` 时自动从 `/dev/tty` 读取交互输入。若环境无 TTY，会**明确报错**而不是静默退出。
 
 ### 下载后执行
 
 ```bash
-curl -fsSL -o install-hy2.sh https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh
+curl -fsSL -o install-hy2.sh "https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh?t=$(date +%s)"
 chmod +x install-hy2.sh
 sudo bash install-hy2.sh
 ```
@@ -51,11 +54,12 @@ sudo bash install-hy2.sh
 | 认证密码 | ✅ | 手输或随机 |
 | 伪装站 masquerade | ✅ | 默认 `www.bing.com` |
 | 服务启停重启 | ✅ | systemd `hysteria-server` |
-| 改配置 | ✅ | 端口、密码、证书、伪装站 |
+| 改配置 | ✅ | 端口、密码、证书、伪装站、带宽 |
+| **带宽 / 加速（可选）** | ✅ | 填带宽切 Brutal，不填用 BBR；**安装时不询问**，按需在菜单开启 |
 | **更新 Hysteria** | ✅ | 官方 `--force`，保留配置 |
 | **UDP 缓冲优化** | ✅ | sysctl `rmem/wmem` 等 |
 | **防火墙自动识别** | ✅ | ufw → firewalld → iptables，自动放行 UDP |
-| 客户端输出 | ✅ | `/root/hy/` 下 YAML / JSON / url / 二维码 |
+| 客户端输出 | ✅ | `/root/hy/` 下 YAML / JSON / url / 二维码 / Clash Meta / sing-box |
 | 更新本脚本 | ✅ | 写入 `/usr/local/bin/install-hy2` |
 
 ## 菜单
@@ -78,8 +82,20 @@ sudo bash install-hy2.sh
 4. 更新 Hysteria 到最新版
 5. UDP 缓冲优化
 6. 自动放行防火墙端口（识别 ufw / firewalld / iptables）
-7. 更新本脚本
-8. 卸载 Hysteria 2
+7. 修复权限并启动（permission denied 用这个）
+8. 更新本脚本
+9. 卸载 Hysteria 2
+0. 返回
+```
+
+「修改配置」子菜单：
+
+```
+1. 修改端口 / 端口跳跃
+2. 修改密码
+3. 修改证书
+4. 修改伪装网站
+5. 带宽 / 加速（Brutal，可选，默认 BBR）
 0. 返回
 ```
 
@@ -113,7 +129,10 @@ ACME 申请证书时会额外按同一逻辑放行 **TCP 80**。
 | `/etc/hysteria/config.yaml` | 服务端配置 |
 | `/etc/hysteria/install.meta` | 安装元数据（改配置用） |
 | `/etc/hysteria/cert.crt` / `private.key` | 自签证书（默认） |
-| `/root/hy/` | 客户端配置与分享链接 |
+| `/root/hy/hy-client.yaml` / `.json` | Hysteria 官方客户端配置 |
+| `/root/hy/clash-meta.yaml` | Clash Meta / mihomo 片段 |
+| `/root/hy/sing-box.json` | sing-box outbound 片段 |
+| `/root/hy/url.txt` / `url-qr.png` | 分享链接与二维码 |
 | `systemctl status hysteria-server` | 服务状态 |
 
 ## 防火墙 / 安全组
@@ -146,6 +165,28 @@ bash install-hy2.sh show            # 显示配置
 
 可在菜单中随时查看、应用或删除该文件。
 
+### 带宽 / 加速（Brutal）说明
+
+**可选功能，安装时不会询问，默认使用 BBR**，需要时进「管理 → 修改配置 → 5」开启。
+
+| 模式 | 触发条件 | 行为 | 适用 |
+|------|----------|------|------|
+| **BBR** | 不填带宽（默认） | 自适应探测，丢包时主动退让 | 线路质量好、丢包低 |
+| **Brutal** | 填写上下行带宽 | 按固定速率发送，无视丢包 | 跨境高丢包 / 延迟抖动大 |
+
+开启后脚本会同时写入服务端 `config.yaml` 与全部客户端配置（含分享链接的
+`upmbps` / `downmbps` 参数），**不需要手动改任何文件**；后续改端口、改密码也不会丢失该设置。
+
+调参要点：
+
+- 填**本地宽带的真实速率**并下调 10~20%，例如实测 100M 下行填 `80`
+- **填太高会自伤式丢包**，比不填更差；**填太低会卡住发送窗口**，导致握手超时
+- 判断优劣时**先看连接成功率，再看延迟数字** —— 超时率高的配置即使延迟好看也要淘汰
+- 回车留空即可关闭 Brutal，退回 BBR
+
+> Brutal 只能压平抖动、减少排队延迟，**降不了物理延迟**。基础 RTT 由服务器地理位置决定，
+> 跨洲线路想真正提速只能换机房区域。
+
 ## 分享链接示例
 
 ```text
@@ -155,6 +196,7 @@ hysteria2://PASSWORD@SERVER_IP:PORT/?insecure=1&sni=www.bing.com#Hysteria2
 - 自签默认 `insecure=1`
 - ACME 真证书默认 `insecure=0`
 - 端口跳跃时附加 `mport=起始-结束`
+- 启用 Brutal 时附加 `upmbps=10&downmbps=30`（多数客户端可识别）
 
 ## 说明
 
