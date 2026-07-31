@@ -25,7 +25,7 @@ if [[ ! -t 0 ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.5.3"
+SCRIPT_VERSION="1.5.4"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 # raw.githubusercontent.com 有约 5 分钟 CDN 缓存，自更新/提权重下时必须绕开，
