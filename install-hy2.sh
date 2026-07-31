@@ -2008,6 +2008,17 @@ update_script() {
   local tmp
   tmp="$(mktemp)"
   if curl -fsSL "$(nocache_url)" -o "$tmp"; then
+    # CDN 错误页、被中断的传输同样是 HTTP 200，直接 cp 进 /usr/local/bin
+    # 就是把一坨 HTML 装成"脚本"，下次运行才发现。装之前先验形。
+    # 不用 head|grep：grep -q 提前退出会给 head 一个 SIGPIPE，
+    # pipefail 下这条管道会假失败，把好脚本也判成坏的
+    local first_line=""
+    read -r first_line <"$tmp" || true
+    if [[ "$first_line" != '#!'* ]] || ! grep -qF 'main "$@"' "$tmp"; then
+      rm -f "$tmp"
+      err "下载内容不是完整的脚本（可能是 CDN 错误页或传输中断），已放弃更新"
+      return 0
+    fi
     local target="/usr/local/bin/install-hy2"
     cp "$tmp" "$target"
     chmod +x "$target"
