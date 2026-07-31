@@ -25,7 +25,7 @@ if [[ ! -t 0 ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.5.3"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 # raw.githubusercontent.com 有约 5 分钟 CDN 缓存，自更新/提权重下时必须绕开，
@@ -168,21 +168,31 @@ is_port_in_use_udp() {
 }
 
 pick_free_udp_port() {
-  local port="${1:-}"
-  if [[ -z "$port" ]]; then
-    port="$(rand_port)"
-  fi
+  local want="${1:-}"
+  local port="$want"
+  [[ -z "$port" ]] && port="$(rand_port)"
+
   local tries=0
   while is_port_in_use_udp "$port"; do
     tries=$((tries + 1))
     [[ $tries -gt 50 ]] && die "无法找到可用的 UDP 端口"
-    if [[ -n "${1:-}" ]]; then
-      err "UDP 端口 $port 已被占用，请重新输入"
-      read -rp "设置 Hysteria 2 端口 [1-65535]（回车随机）: " port
-      [[ -z "$port" ]] && port="$(rand_port)"
-    else
+
+    # 没指定端口：随机到占用的就再换一个，不必打扰用户
+    if [[ -z "$want" ]]; then
       port="$(rand_port)"
+      continue
     fi
+
+    # 指定过端口就由用户决定，不擅自换成随机端口
+    err "UDP 端口 ${port} 已被占用"
+    if [[ -n "${PORT:-}" ]]; then
+      read -rp "换一个端口（回车放弃修改，保持 ${PORT}）: " port
+      [[ -z "$port" ]] && { echo "$PORT"; return 0; }
+    else
+      read -rp "换一个端口（回车随机）: " port
+      [[ -z "$port" ]] && { port="$(rand_port)"; continue; }
+    fi
+    validate_port "$port" || { err "端口不合法: ${port}"; port="$want"; }
   done
   echo "$port"
 }
