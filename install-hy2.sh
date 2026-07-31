@@ -25,7 +25,7 @@ if [[ ! -t 0 ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 # raw.githubusercontent.com 有约 5 分钟 CDN 缓存，自更新/提权重下时必须绕开，
@@ -161,8 +161,10 @@ rand_port() {
 is_port_in_use_udp() {
   local p="$1"
   # $4 才是 Local Address:Port；$5 是 Peer Address，永远是 *:*，
-  # 用 $5 会让端口占用检测永远返回"未占用"
-  ss -H -ulnp 2>/dev/null | awk '{print $4}' | sed 's/.*://g' | grep -qx "$p"
+  # 用 $5 会让端口占用检测永远返回"未占用"。
+  # 排除 hysteria 自身：改端口时旧端口正被本服务监听，那不是冲突；
+  # 不排除的话想沿用原端口会被误判成占用，回车后被迫改成随机端口。
+  ss -H -ulnp 2>/dev/null | grep -vi hysteria | awk '{print $4}' | sed 's/.*://g' | grep -qx "$p"
 }
 
 pick_free_udp_port() {
@@ -708,6 +710,12 @@ apply_port_hop() {
 
 choose_port() {
   echo
+  # 改端口场景下 PORT 已由 load_from_meta 填好。回车是"随机"不是"保持不变"，
+  # 不提示的话很容易一回车就把能用的端口换掉
+  if [[ -n "${PORT:-}" ]]; then
+    yellow "当前端口: ${PORT}"
+    yellow "要保持不变请手动输入 ${PORT}；直接回车会随机换一个新端口"
+  fi
   read -rp "设置 Hysteria 2 端口 [1-65535]（回车随机）: " port_in
   if [[ -n "$port_in" ]]; then
     validate_port "$port_in" || die "端口不合法: $port_in"
