@@ -25,7 +25,7 @@ if [[ ! -t 0 ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.5.0"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 # raw.githubusercontent.com 有约 5 分钟 CDN 缓存，自更新/提权重下时必须绕开，
@@ -160,7 +160,9 @@ rand_port() {
 
 is_port_in_use_udp() {
   local p="$1"
-  ss -H -ulnp 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qx "$p"
+  # $4 才是 Local Address:Port；$5 是 Peer Address，永远是 *:*，
+  # 用 $5 会让端口占用检测永远返回"未占用"
+  ss -H -ulnp 2>/dev/null | awk '{print $4}' | sed 's/.*://g' | grep -qx "$p"
 }
 
 pick_free_udp_port() {
@@ -1402,6 +1404,182 @@ reapply_firewall() {
   open_firewall "$PORT" "${HOP_FIRST:-}" "${HOP_LAST:-}"
 }
 
+### 连通性自检 ###
+# 只读检查，不改任何配置。目的是在给出分享链接前就指出哪一层不通，
+# 而不是让用户拿到一个"看起来正常但永远连不上"的链接。
+is_private_ip() {
+  local ip="$1"
+  [[ "$ip" =~ ^10\. ]] && return 0
+  [[ "$ip" =~ ^192\.168\. ]] && return 0
+  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && return 0
+  # 100.64/10 是运营商级 NAT（CGNAT），同样不可入站
+  [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]] && return 0
+  return 1
+}
+
+# 本机网卡上的全局 IPv4（不含 lo）
+nic_ipv4() {
+  ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1
+}
+
+# 从云厂商元数据服务查"绑定到本机的入站公网 IP"。
+# 查不到返回空（不等于没有，可能只是非云环境），能查到空串才说明确实没绑。
+cloud_public_ip() {
+  local v
+  # Azure
+  v="$(curl -s -m 2 -H Metadata:true --noproxy '*' \
+    "http://169.254.169.254/metadata/instance/network/interface?api-version=2021-02-01" 2>/dev/null \
+    | grep -o '"publicIpAddress":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+  if [[ -n "$v" ]]; then echo "$v"; return 0; fi
+  if curl -s -m 2 -H Metadata:true --noproxy '*' \
+      "http://169.254.169.254/metadata/instance?api-version=2021-02-01" >/dev/null 2>&1; then
+    echo ""; return 0   # 确认是 Azure，且 publicIpAddress 为空
+  fi
+  # GCP
+  v="$(curl -s -m 2 -H 'Metadata-Flavor: Google' --noproxy '*' \
+    "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null || true)"
+  if [[ -n "$v" ]]; then echo "$v"; return 0; fi
+  # 阿里云
+  v="$(curl -s -m 2 --noproxy '*' "http://100.100.100.200/latest/meta-data/eipv4" 2>/dev/null || true)"
+  if [[ -n "$v" ]]; then echo "$v"; return 0; fi
+  # AWS / 腾讯云（IMDSv1 风格）
+  v="$(curl -s -m 2 --noproxy '*' "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)"
+  if [[ -n "$v" ]]; then echo "$v"; return 0; fi
+  return 1
+}
+
+# 本机起客户端连 127.0.0.1，验证服务端配置/证书/密码本身没问题。
+# 走环回不经过防火墙和公网，所以能把"服务端问题"和"网络路径问题"分开。
+selftest_local() {
+  local testport tmpcfg pid rc=1
+  [[ -x "$HY_BIN" && -n "${PORT:-}" && -n "${AUTH_PWD:-}" ]] || return 2
+  testport=$((20000 + RANDOM % 20000))
+  tmpcfg="$(mktemp /tmp/hy2-selftest.XXXXXXXX)"
+  chmod 600 "$tmpcfg"
+  cat >"$tmpcfg" <<EOF
+server: 127.0.0.1:${PORT}
+auth: ${AUTH_PWD}
+tls:
+  sni: ${HY_DOMAIN:-$DEFAULT_SNI}
+  insecure: true
+socks5:
+  listen: 127.0.0.1:${testport}
+EOF
+  "$HY_BIN" client -c "$tmpcfg" >/dev/null 2>&1 &
+  pid=$!
+  sleep 3
+  if curl -s -m 10 -x "socks5h://127.0.0.1:${testport}" \
+      https://www.gstatic.com/generate_204 -o /dev/null 2>/dev/null; then
+    rc=0
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$tmpcfg"
+  return $rc
+}
+
+ck_ok()   { echo -e "  ${GREEN}[OK]${PLAIN}   $*"; }
+ck_warn() { echo -e "  ${YELLOW}[WARN]${PLAIN} $*"; }
+ck_fail() { echo -e "  ${RED}[FAIL]${PLAIN} $*"; }
+
+diagnose_connectivity() {
+  load_from_meta
+  section "连通性自检"
+  if [[ -z "${PORT:-}" ]]; then
+    ck_fail "未找到已安装的端口信息，请先安装"
+    return 0
+  fi
+
+  # 1. 服务与实际监听端口
+  local listen_port=""
+  if systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    listen_port="$(ss -H -ulnp 2>/dev/null | grep -i hysteria | awk '{print $4}' | sed 's/.*://' | head -1 || true)"
+    if [[ -z "$listen_port" ]]; then
+      ck_warn "服务在运行，但未从 ss 读到监听端口"
+    elif [[ "$listen_port" == "$PORT" ]]; then
+      ck_ok "服务监听  UDP ${PORT}"
+    else
+      ck_fail "服务实际监听 UDP ${listen_port}，与配置的 ${PORT} 不一致 —— 防火墙别开错端口"
+    fi
+  else
+    ck_fail "服务未运行，先修复服务再谈连通性（管理菜单 7）"
+  fi
+
+  # 2. 本机防火墙
+  local fw
+  fw="$(detect_firewall)"
+  case "$fw" in
+    ufw)
+      if ufw status 2>/dev/null | grep -q "${PORT}/udp"; then
+        ck_ok "本机防火墙 已放行 UDP ${PORT} (ufw)"
+      else
+        ck_fail "ufw 未放行 UDP ${PORT}（管理菜单 6 可自动放行）"
+      fi ;;
+    firewalld)
+      if firewall-cmd --list-ports 2>/dev/null | grep -q "${PORT}/udp"; then
+        ck_ok "本机防火墙 已放行 UDP ${PORT} (firewalld)"
+      else
+        ck_fail "firewalld 未放行 UDP ${PORT}（管理菜单 6 可自动放行）"
+      fi ;;
+    iptables)
+      if iptables -S INPUT 2>/dev/null | grep -qE "^-P INPUT ACCEPT" \
+         && ! iptables -S INPUT 2>/dev/null | grep -qE '^-A INPUT .*(DROP|REJECT)'; then
+        ck_ok "本机防火墙 INPUT 默认放行，无需额外规则 (iptables)"
+      elif iptables -S INPUT 2>/dev/null | grep -q "dport ${PORT}"; then
+        ck_ok "本机防火墙 已放行 UDP ${PORT} (iptables)"
+      else
+        ck_fail "iptables 未放行 UDP ${PORT}（管理菜单 6 可自动放行）"
+      fi ;;
+    *)
+      ck_ok "本机未启用防火墙，无需放行" ;;
+  esac
+
+  # 3/4. 网卡地址 与 出站地址（判断是否在 NAT 之后）
+  local nic out
+  nic="$(nic_ipv4)"
+  out="$(get_public_ip)"
+  local behind_nat=0
+  if [[ -n "$nic" ]] && is_private_ip "$nic"; then
+    behind_nat=1
+    ck_warn "网卡地址 ${nic} 为私网，机器在 NAT 之后"
+  elif [[ -n "$nic" ]]; then
+    ck_ok "网卡地址 ${nic} 为公网"
+  fi
+  [[ -n "$out" ]] && ck_ok "出站地址 ${out}"
+
+  # 5. 云元数据：有没有真正可入站的公网 IP —— NAT 场景下这条最关键
+  if [[ $behind_nat -eq 1 ]]; then
+    local cip rc=0
+    cip="$(cloud_public_ip)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+      ck_warn "未识别到云元数据服务，无法确认是否有入站公网 IP"
+      ck_warn "请自行确认云控制台已为本机绑定公网 IP，并放行 UDP ${PORT}"
+    elif [[ -z "$cip" ]]; then
+      ck_fail "云元数据显示本机${RED}没有入站公网 IP${PLAIN} —— 外网无法连入！"
+      ck_fail "出站的 ${out} 是共享 SNAT 地址，不能用于入站"
+      ck_fail "需要：给实例关联公网 IP，或让管理员做 UDP ${PORT} 端口映射"
+    else
+      ck_ok "云元数据确认入站公网 IP: ${cip}"
+      [[ -n "$out" && "$cip" != "$out" ]] && \
+        ck_warn "它与出站地址 ${out} 不一致，分享链接请使用 ${cip}"
+    fi
+  fi
+
+  # 6. 端到端自测（走环回，绕开防火墙与公网）
+  local rc=0
+  selftest_local || rc=$?
+  case $rc in
+    0) ck_ok "服务端自测 (socks5 → HTTP 204) 通过，配置/证书/密码均正常" ;;
+    2) ck_warn "缺少二进制或配置信息，跳过服务端自测" ;;
+    *) ck_fail "服务端自测未通过：本机连自己都失败，问题在服务端而非网络" ;;
+  esac
+
+  # 7. 云安全组永远要人工确认
+  echo
+  yellow "提醒：云服务器还需在【安全组 / 网络ACL】控制台放行 UDP ${PORT}"
+  yellow "      本机防火墙与云安全组是独立两层，脚本只能处理前者"
+}
+
 ### 安装主流程 ###
 do_install() {
   if is_installed; then
@@ -1423,6 +1601,7 @@ do_install() {
   hint_firewall "$PORT"
   echo
   title "Hysteria 2 安装完成"
+  diagnose_connectivity
   show_conf
 }
 
@@ -1469,6 +1648,7 @@ do_quick_install() {
 
   echo
   title "Hysteria 2 一键安装完成"
+  diagnose_connectivity
   show_conf
 }
 
@@ -1625,21 +1805,54 @@ menu_change() {
 }
 
 ### 显示配置 ###
-show_conf() {
-  if [[ ! -f "${CLIENT_DIR}/url.txt" ]]; then
-    if is_installed; then
-      warn "客户端文件缺失，尝试根据现有配置重新生成..."
-      load_from_meta
-      if [[ -z "$PORT" || -z "$AUTH_PWD" ]]; then
-        err "meta 不完整，请重新安装"
-        return 0
-      fi
-      write_client_files
-    else
-      err "未找到配置，请先安装"
-      return 0
-    fi
+# 客户端文件缺失时按 meta 重建；0=可用 1=不可用
+ensure_client_files() {
+  [[ -f "${CLIENT_DIR}/url.txt" ]] && return 0
+  if ! is_installed; then
+    err "未找到配置，请先安装"
+    return 1
   fi
+  warn "客户端文件缺失，尝试根据现有配置重新生成..."
+  load_from_meta
+  if [[ -z "$PORT" || -z "$AUTH_PWD" ]]; then
+    err "meta 不完整，请重新安装"
+    return 1
+  fi
+  write_client_files
+}
+
+# 只看链接和二维码。SSH 断开后回来最常用的就是这个，
+# 不必把整份 YAML/JSON 再刷一屏
+show_link() {
+  ensure_client_files || return 0
+  local url
+  url="$(cat "${CLIENT_DIR}/url.txt")"
+
+  section "分享链接"
+  red "$url"
+
+  if [[ -f "${CLIENT_DIR}/url-qr.txt" ]]; then
+    section "二维码"
+    cat "${CLIENT_DIR}/url-qr.txt"
+  elif command -v qrencode >/dev/null 2>&1; then
+    section "二维码"
+    qrencode -t ANSIUTF8 "$url" 2>/dev/null || true
+  else
+    yellow "未安装 qrencode，无法显示二维码（apt/yum install qrencode）"
+  fi
+
+  echo
+  yellow "链接文件: ${CLIENT_DIR}/url.txt"
+  [[ -f "${CLIENT_DIR}/url-qr.png" ]] && yellow "二维码图片: ${CLIENT_DIR}/url-qr.png"
+  if systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    green "服务状态: active (running)"
+  else
+    red "服务状态: inactive / 未运行"
+  fi
+}
+
+show_conf() {
+  ensure_client_files || return 0
 
   section "服务端配置  ${HY_CONF}"
   if [[ -f "$HY_CONF" ]]; then
@@ -1711,33 +1924,39 @@ menu_manage() {
     echo -e "  防火墙 ${YELLOW}$(detect_firewall)${PLAIN}"
     hr
 
+    section "节点"
+    item 1 "查看分享链接 / 二维码"
+    item 2 "显示完整配置（YAML / JSON / 链接 / 二维码）"
+    item 3 "修改配置（端口 / 密码 / 证书 / 伪装站 / 带宽）"
+
     section "服务"
-    item 1 "启动 / 停止 / 重启"
-    item 2 "修改配置（端口 / 密码 / 证书 / 伪装站）"
-    item 3 "显示配置（YAML / JSON / 链接 / 二维码）"
+    item 4 "启动 / 停止 / 重启"
+    item 5 "连通性自检（连不上先跑这个）"
+    itemc "$YELLOW" 6 "${YELLOW}修复权限并启动${PLAIN}（permission denied 点这个）"
 
     section "维护"
-    item 4 "更新 Hysteria 到最新版"
-    item 5 "UDP 缓冲优化"
-    item 6 "自动放行防火墙端口（识别 ufw/firewalld/iptables）"
-    itemc "$YELLOW" 7 "${YELLOW}修复权限并启动${PLAIN}（permission denied 点这个）"
-    item 8 "更新本脚本"
+    item 7 "自动放行防火墙端口（识别 ufw/firewalld/iptables）"
+    item 8 "UDP 缓冲优化"
+    item 9 "更新 Hysteria 到最新版"
+    item 10 "更新本脚本"
 
     section "其它"
-    itemc "$RED" 9 "卸载 Hysteria 2"
+    itemc "$RED" 11 "卸载 Hysteria 2"
     item 0 "返回上级"
     echo
-    read -rp "请输入选项 [0-9]: " m
+    read -rp "请输入选项 [0-11]: " m
     case "$m" in
-      1) menu_switch; pause ;;
-      2) menu_change; pause ;;
-      3) show_conf; pause ;;
-      4) update_hysteria; pause ;;
-      5) menu_udp_optimize; pause ;;
-      6) reapply_firewall; pause ;;
-      7) repair_and_start; pause ;;
-      8) update_script; pause ;;
-      9) do_uninstall; pause ;;
+      1) show_link; pause ;;
+      2) show_conf; pause ;;
+      3) menu_change; pause ;;
+      4) menu_switch; pause ;;
+      5) diagnose_connectivity; pause ;;
+      6) repair_and_start; pause ;;
+      7) reapply_firewall; pause ;;
+      8) menu_udp_optimize; pause ;;
+      9) update_hysteria; pause ;;
+      10) update_script; pause ;;
+      11) do_uninstall; pause ;;
       0) return 0 ;;
       *) err "无效选项"; sleep 1 ;;
     esac
@@ -1760,11 +1979,12 @@ menu() {
   item 2 "一键安装 ${YELLOW}（推荐新手）${PLAIN}"
   hint "全默认：自签 ${DEFAULT_SNI} + 随机端口 + 随机密码 + 伪装 ${DEFAULT_MASQUERADE}"
 
-  section "其它"
-  item 3 "管理功能（启停 / 改配置 / 更新 / 卸载 / UDP 优化 / 防火墙）"
+  section "节点"
+  item 3 "查看分享链接 / 二维码 ${YELLOW}（断线回来看这个）${PLAIN}"
+  item 4 "管理功能（启停 / 改配置 / 自检 / 更新 / 卸载 / 防火墙）"
   item 0 "退出"
   echo
-  read -rp "请输入选项 [0-3]: " input
+  read -rp "请输入选项 [0-4]: " input
   case "$input" in
     1)
       echo
@@ -1778,7 +1998,8 @@ menu() {
       do_quick_install
       pause
       ;;
-    3) menu_manage ;;
+    3) show_link; pause ;;
+    4) menu_manage ;;
     0) exit 0 ;;
     *) err "无效选项"; sleep 1 ;;
   esac
@@ -1805,6 +2026,8 @@ install-hy2-script v${SCRIPT_VERSION}
   bash install-hy2.sh udp             UDP 缓冲优化
   bash install-hy2.sh uninstall       卸载
   bash install-hy2.sh show            显示配置
+  bash install-hy2.sh link            查看分享链接 / 二维码
+  bash install-hy2.sh check           连通性自检
 
 推荐运行（root）:
   bash <(curl -fsSL "${REPO_RAW}?t=\$(date +%s)")
@@ -1847,6 +2070,8 @@ EOF
     update|update-hy2) update_hysteria; exit 0 ;;
     udp|optimize) menu_udp_optimize; exit 0 ;;
     show) show_conf; exit 0 ;;
+    link|url|qr) show_link; exit 0 ;;
+    check|diag|diagnose) diagnose_connectivity; exit 0 ;;
   esac
 
   while true; do
