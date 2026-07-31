@@ -54,6 +54,17 @@ info()   { echo -e "${GREEN}[INFO]${PLAIN} $*"; }
 warn()   { echo -e "${YELLOW}[WARN]${PLAIN} $*"; }
 err()    { echo -e "${RED}[ERROR]${PLAIN} $*" >&2; }
 
+### 排版 ###
+# 中英文混排时，用 # 拼固定宽度边框必然错位（CJK 占 2 列、ANSI 转义占 0 列），
+# 统一改成「分隔线 + 缩进」，任何宽度终端都不会歪。
+HR_LINE="────────────────────────────────────────────────────────────"
+hr()      { echo -e "${BLUE}${HR_LINE}${PLAIN}"; }
+title()   { hr; echo -e "  ${BOLD}${GREEN}$*${PLAIN}"; hr; }
+section() { echo; echo -e "${BLUE}──${PLAIN} ${BOLD}$*${PLAIN} ${BLUE}──${PLAIN}"; }
+item()    { echo -e "  ${GREEN}$1.${PLAIN} ${*:2}"; }
+itemc()   { local c="$1" n="$2"; shift 2; echo -e "  ${c}${n}.${PLAIN} $*"; }
+hint()    { echo -e "     ${YELLOW}$*${PLAIN}"; }
+
 die() {
   err "$*"
   exit 1
@@ -105,7 +116,8 @@ need_root() {
 
   # 2) curl|bash / process substitution：落到临时文件再 sudo
   local tmp
-  tmp="$(mktemp /tmp/install-hy2.XXXXXX.sh)"
+  # 注意：GNU mktemp 只认模板末尾的 X，"XXXXXX.sh" 会报 too few X's in template
+  tmp="$(mktemp /tmp/install-hy2.XXXXXXXX)"
   # shellcheck disable=SC2064
   trap "rm -f '$tmp'" EXIT
 
@@ -337,6 +349,21 @@ get_hy_user() {
   echo "root"
 }
 
+# 以指定用户测试文件可读。0=可读 1=不可读 2=无可用工具（无法验证）
+# 很多纯 root 的精简系统没装 sudo，不能只靠 sudo 判断，否则会误判成权限失败
+can_user_read() {
+  local u="$1" f="$2"
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$u" -- test -r "$f" 2>/dev/null
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -u "$u" test -r "$f" 2>/dev/null
+  elif command -v su >/dev/null 2>&1; then
+    su -s /bin/sh -c "test -r '$f'" "$u" 2>/dev/null
+  else
+    return 2
+  fi
+}
+
 # 把证书挪到 /etc/hysteria，避免 /root 700 导致 hysteria 读不到
 relocate_certs_if_needed() {
   local changed=0
@@ -439,9 +466,14 @@ ensure_config_readable() {
     return 0
   fi
 
-  if sudo -u "$user" test -r "$HY_CONF" 2>/dev/null; then
-    ok_msg="$(echo "config 对 ${user} 可读")"
-    green "[OK] $ok_msg"
+  local rc=0
+  can_user_read "$user" "$HY_CONF" || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    green "[OK] config 对 ${user} 可读"
+    return 0
+  fi
+  if [[ $rc -eq 2 ]]; then
+    warn "系统无 sudo/runuser/su，跳过可读性验证（权限已按 ${user} 设置）"
     return 0
   fi
 
@@ -453,7 +485,9 @@ ensure_config_readable() {
   chmod 644 "$HY_CONF"
   chown -R "${user}:${user}" "$HY_DIR"
 
-  if sudo -u "$user" test -r "$HY_CONF" 2>/dev/null; then
+  rc=0
+  can_user_read "$user" "$HY_CONF" || rc=$?
+  if [[ $rc -eq 0 ]]; then
     green "[OK] 强制修复后 config 可读"
     return 0
   fi
@@ -589,11 +623,10 @@ install_acme_cert() {
 }
 
 choose_cert() {
-  echo
-  green "证书申请方式:"
-  echo -e "  ${GREEN}1.${PLAIN} 自签证书 ${YELLOW}（默认，SNI=${DEFAULT_SNI}）${PLAIN}"
-  echo -e "  ${GREEN}2.${PLAIN} ACME 自动申请（需域名解析到本机）"
-  echo -e "  ${GREEN}3.${PLAIN} 自定义证书路径"
+  section "证书申请方式"
+  item 1 "自签证书 ${YELLOW}（默认，SNI=${DEFAULT_SNI}）${PLAIN}"
+  item 2 "ACME 自动申请（需域名解析到本机）"
+  item 3 "自定义证书路径"
   echo
   read -rp "请输入选项 [1-3]（回车默认 1）: " cert_input
   cert_input="${cert_input:-1}"
@@ -667,10 +700,9 @@ choose_port() {
   PORT="$(pick_free_udp_port "${port_in:-}")"
   yellow "主端口: $PORT"
 
-  echo
-  green "端口模式:"
-  echo -e "  ${GREEN}1.${PLAIN} 单端口 ${YELLOW}（默认）${PLAIN}"
-  echo -e "  ${GREEN}2.${PLAIN} 端口跳跃（iptables DNAT 一段 UDP 端口到主端口）"
+  section "端口模式"
+  item 1 "单端口 ${YELLOW}（默认）${PLAIN}"
+  item 2 "端口跳跃（iptables DNAT 一段 UDP 端口到主端口）"
   echo
   read -rp "请输入选项 [1-2]（回车默认 1）: " jump_in
   jump_in="${jump_in:-1}"
@@ -929,8 +961,7 @@ update_hysteria() {
 
 ### UDP 缓冲优化（对 Hysteria/QUIC 更直接）###
 show_udp_sysctl() {
-  echo
-  blue "──────── 当前 UDP / 网络缓冲相关参数 ────────"
+  section "当前 UDP / 网络缓冲相关参数"
   local keys=(
     net.core.rmem_max
     net.core.wmem_max
@@ -995,12 +1026,11 @@ remove_udp_optimize() {
 }
 
 menu_udp_optimize() {
-  echo
-  green "UDP 缓冲优化（利于 Hysteria 2 / QUIC 高吞吐）:"
-  echo -e "  ${GREEN}1.${PLAIN} 查看当前参数"
-  echo -e "  ${GREEN}2.${PLAIN} 应用优化（写入 ${SYSCTL_HY2_CONF}）"
-  echo -e "  ${GREEN}3.${PLAIN} 移除本脚本的优化文件"
-  echo -e "  ${GREEN}0.${PLAIN} 返回"
+  section "UDP 缓冲优化（利于 Hysteria 2 / QUIC 高吞吐）"
+  item 1 "查看当前参数"
+  item 2 "应用优化（写入 ${SYSCTL_HY2_CONF}）"
+  item 3 "移除本脚本的优化文件"
+  item 0 "返回"
   echo
   read -rp "请选择 [0-3]: " u
   case "$u" in
@@ -1064,6 +1094,17 @@ service_stop() {
 
 is_installed() {
   [[ -x "$HY_BIN" && -f "$HY_CONF" ]]
+}
+
+# 菜单页顶部的一行状态
+status_line() {
+  if ! is_installed; then
+    echo -e "${YELLOW}未安装${PLAIN}"
+  elif systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    echo -e "${GREEN}已安装 · 运行中${PLAIN}   UDP $(meta_get last_port "$(meta_get port)")"
+  else
+    echo -e "${RED}已安装 · 未运行${PLAIN}"
+  fi
 }
 
 ### 防火墙：自动识别 ufw / firewalld / iptables ###
@@ -1253,21 +1294,18 @@ do_install() {
   service_start
   hint_firewall "$PORT"
   echo
-  green "=========================================="
-  green " Hysteria 2 安装完成"
-  green "=========================================="
+  title "Hysteria 2 安装完成"
   show_conf
 }
 
 # 一键安装：全默认，不再逐步问证书/端口/密码
 # 自签 www.bing.com + 随机端口 + 随机密码 + 伪装 www.bing.com + 单端口
 do_quick_install() {
-  echo
-  green "一键安装默认参数:"
-  echo "  证书: 自签 (SNI=${DEFAULT_SNI})"
-  echo "  端口: 随机 UDP（单端口，无跳跃）"
-  echo "  密码: 随机生成"
-  echo "  伪装: ${DEFAULT_MASQUERADE}"
+  section "一键安装默认参数"
+  echo "  证书   自签 (SNI=${DEFAULT_SNI})"
+  echo "  端口   随机 UDP（单端口，无跳跃）"
+  echo "  密码   随机生成"
+  echo "  伪装   ${DEFAULT_MASQUERADE}"
   echo
   if is_installed; then
     warn "检测到已安装，继续将覆盖现有配置"
@@ -1302,9 +1340,7 @@ do_quick_install() {
   hint_firewall "$PORT"
 
   echo
-  green "=========================================="
-  green " Hysteria 2 一键安装完成"
-  green "=========================================="
+  title "Hysteria 2 一键安装完成"
   show_conf
 }
 
@@ -1339,12 +1375,11 @@ do_uninstall() {
 
 ### 服务开关菜单 ###
 menu_switch() {
-  echo
-  green "服务管理:"
-  echo -e "  ${GREEN}1.${PLAIN} 启动"
-  echo -e "  ${GREEN}2.${PLAIN} 停止"
-  echo -e "  ${GREEN}3.${PLAIN} 重启"
-  echo -e "  ${GREEN}0.${PLAIN} 返回"
+  section "服务管理"
+  item 1 "启动"
+  item 2 "停止"
+  item 3 "重启"
+  item 0 "返回"
   echo
   read -rp "请选择 [0-3]: " s
   case "$s" in
@@ -1420,13 +1455,12 @@ change_masquerade() {
 
 menu_change() {
   is_installed || { err "尚未安装"; return 0; }
-  echo
-  green "修改配置:"
-  echo -e "  ${GREEN}1.${PLAIN} 修改端口 / 端口跳跃"
-  echo -e "  ${GREEN}2.${PLAIN} 修改密码"
-  echo -e "  ${GREEN}3.${PLAIN} 修改证书"
-  echo -e "  ${GREEN}4.${PLAIN} 修改伪装网站"
-  echo -e "  ${GREEN}0.${PLAIN} 返回"
+  section "修改配置"
+  item 1 "修改端口 / 端口跳跃"
+  item 2 "修改密码"
+  item 3 "修改证书"
+  item 4 "修改伪装网站"
+  item 0 "返回"
   echo
   read -rp "请选择 [0-4]: " c
   case "$c" in
@@ -1455,31 +1489,25 @@ show_conf() {
     fi
   fi
 
-  echo
-  blue "──────── 服务端配置 ${HY_CONF} ────────"
+  section "服务端配置  ${HY_CONF}"
   if [[ -f "$HY_CONF" ]]; then
     cat "$HY_CONF"
   fi
 
-  echo
-  blue "──────── 客户端 YAML ${CLIENT_DIR}/hy-client.yaml ────────"
+  section "客户端 YAML  ${CLIENT_DIR}/hy-client.yaml"
   cat "${CLIENT_DIR}/hy-client.yaml"
 
-  echo
-  blue "──────── 客户端 JSON ${CLIENT_DIR}/hy-client.json ────────"
+  section "客户端 JSON  ${CLIENT_DIR}/hy-client.json"
   cat "${CLIENT_DIR}/hy-client.json"
 
-  echo
-  blue "──────── 分享链接 ${CLIENT_DIR}/url.txt ────────"
+  section "分享链接  ${CLIENT_DIR}/url.txt"
   red "$(cat "${CLIENT_DIR}/url.txt")"
 
   if [[ -f "${CLIENT_DIR}/url-qr.txt" ]]; then
-    echo
-    blue "──────── 分享链接二维码 ────────"
+    section "分享链接二维码"
     cat "${CLIENT_DIR}/url-qr.txt"
   elif command -v qrencode >/dev/null 2>&1; then
-    echo
-    blue "──────── 分享链接二维码 ────────"
+    section "分享链接二维码"
     qrencode -t ANSIUTF8 "$(cat "${CLIENT_DIR}/url.txt")" 2>/dev/null || true
   else
     yellow "未安装 qrencode，跳过终端二维码（可 apt/yum install qrencode）"
@@ -1519,24 +1547,26 @@ update_script() {
 menu_manage() {
   while true; do
     clear
-    echo "#############################################################"
-    echo -e "#                    ${GREEN}管理功能${PLAIN}                              #"
-    echo "#############################################################"
-    echo
-    local fw_now
-    fw_now="$(detect_firewall)"
-    echo -e "  当前防火墙: ${YELLOW}${fw_now}${PLAIN}"
-    echo
-    echo -e "  ${GREEN}1.${PLAIN} 启动 / 停止 / 重启"
-    echo -e "  ${GREEN}2.${PLAIN} 修改配置（端口/密码/证书/伪装站）"
-    echo -e "  ${GREEN}3.${PLAIN} 显示配置（YAML / JSON / 链接 / 二维码）"
-    echo -e "  ${GREEN}4.${PLAIN} 更新 Hysteria 到最新版"
-    echo -e "  ${GREEN}5.${PLAIN} UDP 缓冲优化"
-    echo -e "  ${GREEN}6.${PLAIN} 自动放行防火墙端口（识别 ufw/firewalld/iptables）"
-    echo -e "  ${YELLOW}7.${PLAIN} ${YELLOW}修复权限并启动${PLAIN}（permission denied 点这个）"
-    echo -e "  ${GREEN}8.${PLAIN} 更新本脚本"
-    echo -e "  ${RED}9.${PLAIN} 卸载 Hysteria 2"
-    echo -e "  ${GREEN}0.${PLAIN} 返回上级"
+    title "管理功能"
+    echo -e "  状态   $(status_line)"
+    echo -e "  防火墙 ${YELLOW}$(detect_firewall)${PLAIN}"
+    hr
+
+    section "服务"
+    item 1 "启动 / 停止 / 重启"
+    item 2 "修改配置（端口 / 密码 / 证书 / 伪装站）"
+    item 3 "显示配置（YAML / JSON / 链接 / 二维码）"
+
+    section "维护"
+    item 4 "更新 Hysteria 到最新版"
+    item 5 "UDP 缓冲优化"
+    item 6 "自动放行防火墙端口（识别 ufw/firewalld/iptables）"
+    itemc "$YELLOW" 7 "${YELLOW}修复权限并启动${PLAIN}（permission denied 点这个）"
+    item 8 "更新本脚本"
+
+    section "其它"
+    itemc "$RED" 9 "卸载 Hysteria 2"
+    item 0 "返回上级"
     echo
     read -rp "请输入选项 [0-9]: " m
     case "$m" in
@@ -1558,23 +1588,22 @@ menu_manage() {
 ### 主菜单：先选 交互式 / 一键 ###
 menu() {
   clear
-  echo "#############################################################"
-  echo -e "#          ${GREEN}Hysteria 2 安装脚本${PLAIN}  v${SCRIPT_VERSION}                #"
-  echo -e "#   ${BLUE}https://github.com/JasonZhangDad/install-hy2-script${PLAIN}  #"
-  echo -e "#   ${YELLOW}权限: ROOT 已确认${PLAIN}  uid=$(id -u)  user=$(id -un)          #"
-  echo "#############################################################"
-  echo
-  green "请选择安装模式（当前为 root，可继续）:"
-  echo
-  echo -e "  ${GREEN}1.${PLAIN} 交互式安装"
-  echo -e "      逐步选择：证书类型 / 端口 / 密码 / 伪装站 / 端口跳跃"
-  echo
-  echo -e "  ${GREEN}2.${PLAIN} 一键安装 ${YELLOW}（推荐新手）${PLAIN}"
-  echo -e "      全默认：自签 ${DEFAULT_SNI} + 随机端口 + 随机密码 + 伪装 ${DEFAULT_MASQUERADE}"
-  echo
-  echo "  -----------------------------------------------"
-  echo -e "  ${GREEN}3.${PLAIN} 管理功能（启停 / 改配置 / 更新 / 卸载 / UDP 优化 / 防火墙）"
-  echo -e "  ${GREEN}0.${PLAIN} 退出"
+  title "Hysteria 2 安装脚本  v${SCRIPT_VERSION}"
+  echo -e "  仓库   ${BLUE}https://github.com/JasonZhangDad/install-hy2-script${PLAIN}"
+  echo -e "  系统   ${PRETTY_OS:-unknown}"
+  echo -e "  权限   root  (uid=$(id -u)  user=$(id -un))"
+  echo -e "  状态   $(status_line)"
+  hr
+
+  section "安装"
+  item 1 "交互式安装"
+  hint "逐步选择：证书类型 / 端口 / 密码 / 伪装站 / 端口跳跃"
+  item 2 "一键安装 ${YELLOW}（推荐新手）${PLAIN}"
+  hint "全默认：自签 ${DEFAULT_SNI} + 随机端口 + 随机密码 + 伪装 ${DEFAULT_MASQUERADE}"
+
+  section "其它"
+  item 3 "管理功能（启停 / 改配置 / 更新 / 卸载 / UDP 优化 / 防火墙）"
+  item 0 "退出"
   echo
   read -rp "请输入选项 [0-3]: " input
   case "$input" in
@@ -1628,6 +1657,14 @@ EOF
       exit 0
       ;;
   esac
+
+  # 本脚本全程需要交互输入。没有可用 TTY 时提前报错，
+  # 否则 read 在 set -e 下会让脚本静默退出（exit 1，无任何提示）
+  if [[ ! -t 0 ]]; then
+    err "未检测到可交互终端：stdin 不是 TTY，且 /dev/tty 不可用。"
+    err "请在 SSH 终端中运行，推荐: bash <(curl -fsSL ${REPO_RAW})"
+    exit 1
+  fi
 
   # 强制 root（非 root 自动 sudo 重跑）
   need_root "$@"
