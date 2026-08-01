@@ -25,7 +25,7 @@ if [[ ! -t 0 ]]; then
 fi
 
 ### 常量 ###
-SCRIPT_VERSION="1.5.4"
+SCRIPT_VERSION="1.6.0"
 SYSCTL_HY2_CONF="/etc/sysctl.d/99-hysteria2.conf"
 REPO_RAW="https://raw.githubusercontent.com/JasonZhangDad/install-hy2-script/main/install-hy2.sh"
 # raw.githubusercontent.com 有约 5 分钟 CDN 缓存，自更新/提权重下时必须绕开，
@@ -474,6 +474,13 @@ fix_hy_permissions() {
     fi
   fi
 
+  # CA 私钥（选项5）不交给服务运行用户：拿到它就能签出被客户端信任的任意证书，
+  # 而 hysteria 只需要叶子证书和叶子私钥。上面的 chown -R 会把它一起带走，这里改回来。
+  if [[ -f "${HY_DIR}/ca.key" ]]; then
+    chown root:root "${HY_DIR}/ca.key" 2>/dev/null || true
+    chmod 600 "${HY_DIR}/ca.key" || true
+  fi
+
   # chown 之后再收权限，确保属主已经是运行用户
   [[ -f "$HY_CONF" ]] && { chmod 600 "$HY_CONF" || true; }
   [[ -f "$HY_META" ]] && { chmod 600 "$HY_META" || true; }
@@ -710,13 +717,151 @@ install_acme_cert() {
   green "ACME 证书申请成功: $domain（已安装到 ${HY_DIR}）"
 }
 
+# 服务器证书的 SHA-256 指纹，OpenSSL 的冒号 hex 格式。
+# 一个值喂三个地方，都认这个格式：
+#   hysteria pinSHA256 / mihomo fingerprint（去冒号小写后比对）
+#   Xray pinnedPeerCertSha256（内部 ReplaceAll(":","") 再 hex 解码，须 32 字节）
+cert_fingerprints() {
+  local cert="$1"
+  [[ -f "$cert" && -s "$cert" ]] || die "证书文件不存在或为空: $cert"
+
+  PIN_SHA256="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d ' ')"
+  [[ -n "$PIN_SHA256" ]] || die "计算证书 SHA-256 失败: $cert"
+
+  local hex="${PIN_SHA256//:/}"
+  [[ "${#hex}" -eq 64 ]] || die "证书 SHA-256 长度异常（应为 32 字节）: $PIN_SHA256"
+}
+
+# 选项5：私有 CA + CA 签发的服务器叶子证书（CA:FALSE）+ SHA-256 指纹
+#
+# 与选项1那张裸自签证书的区别：叶子证书带 SAN 和 serverAuth，并且由一张
+# 独立的 CA 签发。客户端因此有两条真校验路径 —— 导入 CA 或固定叶子指纹，
+# 都不用再打开 insecure / allowInsecure（最新版 Xray 已经没有后者了）。
+#
+# 扩展一律写在配置文件里而不是 -addext：后者要 OpenSSL 1.1.1+，
+# 而 CentOS 7 一类老系统上还是 1.0.2。
+gen_pinned_self_signed() {
+  local sni="${1:-$DEFAULT_SNI}"
+  validate_domain "$sni" || die "SNI/CN 不合法: $sni"
+  mkdir -p "$HY_DIR"
+
+  local ca_key="${HY_DIR}/ca.key"
+  local ca_crt="${HY_DIR}/ca.crt"
+  local key="${HY_DIR}/private.key"
+  local cert="${HY_DIR}/cert.crt"
+
+  local tmp
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  cat >"${tmp}/ca.cnf" <<EOF
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = ${sni} CA
+[v3_ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+EOF
+
+  cat >"${tmp}/leaf.cnf" <<EOF
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = ${sni}
+[v3_leaf]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyAgreement
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:${sni}
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+EOF
+
+  info "创建私有 CA ..."
+  openssl ecparam -genkey -name prime256v1 -out "$ca_key" 2>/dev/null || die "生成 CA 私钥失败"
+  openssl req -new -x509 -days 3650 -key "$ca_key" -out "$ca_crt" \
+    -config "${tmp}/ca.cnf" -extensions v3_ca 2>/dev/null || die "生成私有 CA 证书失败"
+
+  info "由 CA 签发服务器证书（CA:FALSE, SAN=${sni}）..."
+  openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null || die "生成服务器私钥失败"
+  openssl req -new -key "$key" -out "${tmp}/leaf.csr" \
+    -config "${tmp}/leaf.cnf" 2>/dev/null || die "生成服务器 CSR 失败"
+  openssl x509 -req -in "${tmp}/leaf.csr" -CA "$ca_crt" -CAkey "$ca_key" \
+    -CAserial "${tmp}/ca.srl" -CAcreateserial -days 3650 -sha256 \
+    -extfile "${tmp}/leaf.cnf" -extensions v3_leaf -out "$cert" 2>/dev/null \
+    || die "CA 签发服务器证书失败"
+
+  # 签出来但验不过等于白签，客户端到时候只会报一个看不懂的 TLS 错误
+  openssl verify -CAfile "$ca_crt" "$cert" >/dev/null 2>&1 \
+    || die "服务器证书无法被私有 CA 验证，请检查 openssl 版本"
+
+  chmod 600 "$ca_key" 2>/dev/null || true
+  chmod 644 "$ca_crt" 2>/dev/null || true
+
+  CERT_PATH="$cert"
+  KEY_PATH="$key"
+  CA_PATH="$ca_crt"
+  HY_DOMAIN="$sni"
+  CERT_MODE="pinned"
+  CLIENT_INSECURE="false"
+  cert_fingerprints "$cert"
+  fix_hy_permissions
+
+  green "已生成私有 CA 与服务器证书，SNI/CN: ${sni}"
+  green "服务器证书 SHA-256: ${PIN_SHA256}"
+}
+
+# 选项4：自有域名 + ACME 正式证书。复用 install_acme_cert，
+# 额外把 Cloudflare 灰云等前置条件说清楚，并标记要输出 Xray 配置。
+choose_cert_domain_acme() {
+  section "自有域名 + ACME 正式证书"
+  yellow "前置条件（不满足会申请失败）："
+  echo "  1) 域名 A / AAAA 记录已解析到本机公网 IP"
+  echo "  2) Cloudflare 等 CDN 必须切【灰云 / DNS only】——"
+  echo "     橙云会代理 80 端口导致 ACME 失败，也不转发 QUIC，节点必然连不上"
+  echo "  3) 云厂商安全组放行 TCP 80（申请与续期用，脚本会自动开关本机防火墙）"
+  echo
+  local domain
+  read -rp "请输入你的域名: " domain
+  [[ -n "$domain" ]] || die "未输入域名"
+
+  install_acme_cert "$domain"
+  XRAY_OUT=1
+  green "正式证书模式：客户端 insecure=false，不生成 allowInsecure / insecure=1"
+}
+
+# 选项5：自签 + SHA-256 证书固定
+choose_cert_pinned() {
+  section "自签证书 + SHA-256 证书固定"
+  yellow "适用于没有域名的机器：客户端用证书指纹做真校验，"
+  yellow "最新版 Xray 移除 allowInsecure 之后也能连。"
+  warn "隐蔽性提醒：自签证书仍可能被主动探测识别，追求最强抗识别请用选项 4。"
+  echo
+  local sni
+  read -rp "SNI/CN（回车默认 ${DEFAULT_SNI}，建议填常见站点域名）: " sni
+  sni="${sni:-$DEFAULT_SNI}"
+  gen_pinned_self_signed "$sni"
+  XRAY_OUT=1
+}
+
 choose_cert() {
+  # 每次重选证书都先复位，避免从 meta 带进来的旧标记影响新模式
+  XRAY_OUT=""
   section "证书申请方式"
   item 1 "自签证书 ${YELLOW}（默认，SNI=${DEFAULT_SNI}）${PLAIN}"
   item 2 "ACME 自动申请（需域名解析到本机）"
   item 3 "自定义证书路径"
+  item 4 "自有域名 + ACME 正式证书 ${YELLOW}（推荐，最新版 Xray 使用）${PLAIN}"
+  hint "自动校验解析 / 放行 80 / 自动续期；链接 insecure=0，粘贴即用"
+  item 5 "自签证书 + SHA-256 证书固定 ${YELLOW}（无域名，最新版 Xray 使用）${PLAIN}"
+  hint "私有 CA 签发叶子证书，客户端用指纹校验，不依赖 allowInsecure"
   echo
-  read -rp "请输入选项 [1-3]（回车默认 1）: " cert_input
+  read -rp "请输入选项 [1-5]（回车默认 1）: " cert_input
   cert_input="${cert_input:-1}"
 
   case "$cert_input" in
@@ -742,6 +887,12 @@ choose_cert() {
         CLIENT_INSECURE="true"
       fi
       green "已使用自定义证书，SNI: $domain"
+      ;;
+    4)
+      choose_cert_domain_acme
+      ;;
+    5)
+      choose_cert_pinned
       ;;
     *)
       read -rp "自签证书 SNI/CN（回车默认 ${DEFAULT_SNI}）: " sni
@@ -943,8 +1094,116 @@ EOF
   ensure_config_readable
 }
 
+# PEM 文本 -> sing-box "certificate" 字段要的 JSON 字符串数组元素（每行一个）
+pem_to_json_lines() {
+  awk 'NF { lines[++n] = $0 }
+       END { for (i = 1; i <= n; i++) printf "      \"%s\"%s\n", lines[i], (i < n ? "," : "") }' "$1"
+}
+
+# 最新版 Xray 已原生支持 Hysteria2（protocol: hysteria + network: hysteria），
+# 最新版 v2rayN 正是用 Xray 内核跑 hy2 节点，所以这里直接给一份能用的 outbound。
+#
+# 同一版 Xray 移除了 allowInsecure —— 配置里出现它会直接报错拒绝启动，
+# 自签证书改用 pinnedPeerCertSha256（简写 pcs），值就是冒号 hex 指纹。
+# 正式证书（选项4）走系统信任链，两个字段都不需要。
+write_xray_outbound() {
+  local pin_line=""
+  local note="Xray outbound（最新版 Xray / v2rayN 使用）。本节点用的是正式证书，直接走系统信任链校验，不需要任何跳过校验的开关。把本对象放进你的 Xray 配置 outbounds 数组即可。"
+  if [[ "${CERT_MODE:-}" == "pinned" && -n "${PIN_SHA256:-}" ]]; then
+    pin_line=",
+      \"pinnedPeerCertSha256\": \"${PIN_SHA256}\""
+    note="Xray outbound（最新版 Xray / v2rayN 使用）。最新版 Xray 已移除跳过证书校验的开关，自签证书改用下面的证书固定字段做真校验。把本对象放进你的 Xray 配置 outbounds 数组即可。"
+  fi
+
+  cat >"${CLIENT_DIR}/xray-outbound.json" <<EOF
+{
+  "_note": "${note}",
+  "tag": "hysteria2",
+  "protocol": "hysteria",
+  "settings": {
+    "version": 2,
+    "address": "${1}",
+    "port": ${PORT}
+  },
+  "streamSettings": {
+    "network": "hysteria",
+    "security": "tls",
+    "tlsSettings": {
+      "serverName": "${HY_DOMAIN}"${pin_line}
+    },
+    "hysteriaSettings": {
+      "version": 2,
+      "auth": "${AUTH_PWD}"
+    }
+  }
+}
+EOF
+  chmod 600 "${CLIENT_DIR}/xray-outbound.json" 2>/dev/null || true
+}
+
+# 选项5 的兼容产物：给不支持 pinSHA256 / 自定义 CA 的老客户端。
+# 它们只能靠 insecure=1 跳过证书校验，安全性低于主配置，
+# 所以单独成文件、文件名带 -compat，并在能写注释的格式里明确标注。
+write_compat_client_files() {
+  local host="$1" ip="$2" bw_url="$3" bw_clash="$4" bw_sing="$5"
+  local remark="Hysteria2-compat"
+
+  local url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=1&sni=${HY_DOMAIN}${bw_url}#${remark}"
+  if [[ -n "${HOP_FIRST:-}" && -n "${HOP_LAST:-}" ]]; then
+    url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=1&sni=${HY_DOMAIN}&mport=${HOP_FIRST}-${HOP_LAST}${bw_url}#${remark}"
+  fi
+  echo "$url" >"${CLIENT_DIR}/url-compat.txt"
+
+  cat >"${CLIENT_DIR}/clash-meta-compat.yaml" <<EOF
+# 仅用于兼容客户端：skip-cert-verify 会跳过证书校验，安全性低于 clash-meta.yaml
+# 客户端支持 fingerprint 时请优先用 clash-meta.yaml
+proxies:
+  - name: "${remark}"
+    type: hysteria2
+    server: ${ip}
+    port: ${PORT}
+    password: ${AUTH_PWD}
+    sni: ${HY_DOMAIN}
+    skip-cert-verify: true${bw_clash}
+EOF
+
+  # sing-box 用严格 JSON 解析，多一个注释字段就会启动失败，这里不能加 _note
+  cat >"${CLIENT_DIR}/sing-box-compat.json" <<EOF
+{
+  "type": "hysteria2",
+  "tag": "${remark}",
+  "server": "${ip}",
+  "server_port": ${PORT},
+  "password": "${AUTH_PWD}",${bw_sing}
+  "tls": {
+    "enabled": true,
+    "server_name": "${HY_DOMAIN}",
+    "insecure": true
+  }
+}
+EOF
+
+  if [[ -n "${CA_PATH:-}" && -f "${CA_PATH}" ]]; then
+    cp -f "$CA_PATH" "${CLIENT_DIR}/ca.crt"
+    chmod 644 "${CLIENT_DIR}/ca.crt" 2>/dev/null || true
+  fi
+
+  chmod 600 "${CLIENT_DIR}/url-compat.txt" "${CLIENT_DIR}/clash-meta-compat.yaml" \
+            "${CLIENT_DIR}/sing-box-compat.json" 2>/dev/null || true
+
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t ANSIUTF8 -o "${CLIENT_DIR}/url-compat-qr.txt" "$url" 2>/dev/null || true
+  fi
+  return 0
+}
+
 write_client_files() {
   local ip host insecure_yaml insecure_json insecure_url
+  # 非固定模式下清掉可能从 meta 带进来的旧指纹，避免改完证书还残留上一套 pin
+  if [[ "${CERT_MODE:-}" != "pinned" ]]; then
+    PIN_SHA256=""
+    CA_PATH=""
+  fi
   ip="$(get_public_ip)"
   if [[ -z "$ip" ]]; then
     warn "无法自动获取公网 IP，客户端配置中的 server 将使用占位符"
@@ -965,6 +1224,35 @@ write_client_files() {
   mkdir -p "$CLIENT_DIR"
   # 目录内每个文件都含密码；/root 通常已是 700，这里再收一道
   chmod 700 "$CLIENT_DIR" 2>/dev/null || true
+
+  # 证书固定（选项5）：三种客户端各有各的真校验方式，逐个给对。
+  #   hysteria 官方客户端：设了 pinSHA256 也不会关掉标准链校验 —— Go 是先验链、
+  #     验过了才调 VerifyPeerCertificate，私有 CA 必然卡在第一步。所以 hysteria
+  #     侧必须 insecure=true：跳过的只是"公共 CA 信任链"，真正的校验由指纹完成。
+  #     最新版 v2rayN 读到 pinSHA256 会强制 allowInsecure=false 并下发
+  #     pinnedPeerCertSha256，链接里的 insecure=1 反而会被它覆盖掉。
+  #   mihomo：fingerprint 内部自带跳过逻辑，skip-cert-verify 保持 false。
+  #   sing-box：内嵌 CA 走正常链校验，insecure 必须 false，否则 CA 白给。
+  local hy_insecure_yaml="$insecure_yaml" hy_insecure_json="$insecure_json" hy_insecure_url="$insecure_url"
+  local pin_yaml="" pin_json="" pin_url="" pin_clash="" sing_ca=""
+  if [[ "${CERT_MODE:-}" == "pinned" && -n "${PIN_SHA256:-}" ]]; then
+    hy_insecure_yaml="true"
+    hy_insecure_json="true"
+    hy_insecure_url="1"
+    pin_yaml="
+  pinSHA256: ${PIN_SHA256}"
+    pin_json=",
+    \"pinSHA256\": \"${PIN_SHA256}\""
+    pin_url="&pinSHA256=${PIN_SHA256}"
+    pin_clash="
+    fingerprint: \"${PIN_SHA256}\""
+    if [[ -n "${CA_PATH:-}" && -f "${CA_PATH}" ]]; then
+      sing_ca=",
+    \"certificate\": [
+$(pem_to_json_lines "${CA_PATH}")
+    ]"
+    fi
+  fi
 
   # 带宽片段：设了才写，写了就是 Brutal，不写是 BBR
   local bw_yaml="" bw_json="" bw_url="" bw_clash="" bw_sing=""
@@ -996,7 +1284,7 @@ auth: ${AUTH_PWD}
 
 tls:
   sni: ${HY_DOMAIN}
-  insecure: ${insecure_yaml}
+  insecure: ${hy_insecure_yaml}${pin_yaml}
 ${bw_yaml}
 quic:
   initStreamReceiveWindow: 16777216
@@ -1023,7 +1311,7 @@ EOF
   "auth": "${AUTH_PWD}",
   "tls": {
     "sni": "${HY_DOMAIN}",
-    "insecure": ${insecure_json}
+    "insecure": ${hy_insecure_json}${pin_json}
   },
   "quic": {
     "initStreamReceiveWindow": 16777216,
@@ -1047,10 +1335,10 @@ EOF
 EOF
 
   local remark="Hysteria2"
-  local url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${insecure_url}&sni=${HY_DOMAIN}${bw_url}#${remark}"
+  local url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${hy_insecure_url}&sni=${HY_DOMAIN}${pin_url}${bw_url}#${remark}"
   # 端口跳跃时，分享链接主端口仍用主 listen 端口；跳跃范围写在备注
   if [[ -n "${HOP_FIRST:-}" && -n "${HOP_LAST:-}" ]]; then
-    url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${insecure_url}&sni=${HY_DOMAIN}&mport=${HOP_FIRST}-${HOP_LAST}${bw_url}#${remark}"
+    url="hysteria2://${AUTH_PWD}@${host}:${PORT}/?insecure=${hy_insecure_url}&sni=${HY_DOMAIN}${pin_url}&mport=${HOP_FIRST}-${HOP_LAST}${bw_url}#${remark}"
   fi
   echo "$url" >"${CLIENT_DIR}/url.txt"
 
@@ -1063,7 +1351,7 @@ proxies:
     port: ${PORT}
     password: ${AUTH_PWD}
     sni: ${HY_DOMAIN}
-    skip-cert-verify: ${insecure_yaml}${bw_clash}
+    skip-cert-verify: ${insecure_yaml}${bw_clash}${pin_clash}
 EOF
 
   # sing-box outbound 片段
@@ -1077,7 +1365,7 @@ EOF
   "tls": {
     "enabled": true,
     "server_name": "${HY_DOMAIN}",
-    "insecure": ${insecure_json}
+    "insecure": ${insecure_json}${sing_ca}
   }
 }
 EOF
@@ -1093,6 +1381,21 @@ EOF
     qrencode -t PNG -o "${CLIENT_DIR}/url-qr.png" "$url" 2>/dev/null || true
   fi
 
+  # 选项 4 / 5 额外产物：Xray TLS 片段；固定模式再补一套兼容配置。
+  # 换过证书方式的要把上一套删掉 —— 那些文件里是旧密码旧指纹，留着只会误导。
+  if [[ "${XRAY_OUT:-}" == "1" ]]; then
+    write_xray_outbound "$ip"
+  else
+    rm -f "${CLIENT_DIR}/xray-outbound.json"
+  fi
+  if [[ "${CERT_MODE:-}" == "pinned" ]]; then
+    write_compat_client_files "$host" "$ip" "$bw_url" "$bw_clash" "$bw_sing"
+  else
+    rm -f "${CLIENT_DIR}/url-compat.txt" "${CLIENT_DIR}/url-compat-qr.txt" \
+          "${CLIENT_DIR}/clash-meta-compat.yaml" "${CLIENT_DIR}/sing-box-compat.json" \
+          "${CLIENT_DIR}/ca.crt"
+  fi
+
   # 持久化 meta
   meta_set port "$PORT"
   meta_set last_port "$LAST_PORT"
@@ -1102,6 +1405,9 @@ EOF
   meta_set key_path "$KEY_PATH"
   meta_set cert_mode "$CERT_MODE"
   meta_set insecure "$CLIENT_INSECURE"
+  meta_set pin_sha256 "${PIN_SHA256:-}"
+  meta_set ca_path "${CA_PATH:-}"
+  meta_set xray_out "${XRAY_OUT:-}"
   meta_set masquerade "$PROXY_SITE"
   meta_set public_ip "$ip"
   meta_set bw_up "${BW_UP:-}"
@@ -1829,6 +2135,11 @@ load_from_meta() {
   KEY_PATH="$(meta_get key_path "${HY_DIR}/private.key")"
   CERT_MODE="$(meta_get cert_mode self)"
   CLIENT_INSECURE="$(meta_get insecure true)"
+  # 改端口 / 改密码后要重写客户端文件，指纹和 CA 路径必须一起带回来，
+  # 否则固定模式的链接会退化成没有 pinSHA256 的普通链接
+  PIN_SHA256="$(meta_get pin_sha256)"
+  CA_PATH="$(meta_get ca_path)"
+  XRAY_OUT="$(meta_get xray_out)"
   PROXY_SITE="$(meta_get masquerade "$DEFAULT_MASQUERADE")"
   HOP_FIRST="$(meta_get hop_first)"
   HOP_LAST="$(meta_get hop_last)"
@@ -1958,6 +2269,8 @@ show_link() {
     yellow "未安装 qrencode，无法显示二维码（apt/yum install qrencode）"
   fi
 
+  show_pinned_info
+
   echo
   yellow "链接文件: ${CLIENT_DIR}/url.txt"
   [[ -f "${CLIENT_DIR}/url-qr.png" ]] && yellow "二维码图片: ${CLIENT_DIR}/url-qr.png"
@@ -1966,6 +2279,34 @@ show_link() {
   else
     red "服务状态: inactive / 未运行"
   fi
+}
+
+# 固定模式（选项5）专属：指纹 + CA + 兼容链接。
+# 兼容链接必须带着"仅用于兼容客户端"的标注一起显示，不能和主链接混在一起。
+show_pinned_info() {
+  [[ "$(meta_get cert_mode)" == "pinned" ]] || return 0
+
+  section "证书固定（SHA-256 Pinning）"
+  green "服务器证书 SHA-256: $(meta_get pin_sha256)"
+  yellow "  私有 CA 证书        : ${CLIENT_DIR}/ca.crt"
+  echo "  主链接里的 insecure=1 不代表不校验：它只是跳过公共 CA 信任链，"
+  echo "  真正的校验由 pinSHA256 指纹完成，中间人换证书一样连不上。"
+  echo "  各客户端的校验方式："
+  echo "    - v2rayN（Xray 内核）  : 自动转成 pinnedPeerCertSha256，并强制关掉 allowInsecure"
+  echo "    - Hysteria2 / NekoBox  : 主链接里的 pinSHA256"
+  echo "    - mihomo / Clash Meta  : clash-meta.yaml 的 fingerprint"
+  echo "    - sing-box             : sing-box.json 内嵌的 CA 证书"
+
+  if [[ -f "${CLIENT_DIR}/url-compat.txt" ]]; then
+    section "兼容链接  ${YELLOW}仅用于兼容客户端${PLAIN}"
+    red "$(cat "${CLIENT_DIR}/url-compat.txt")"
+    warn "该链接没有指纹，只有 insecure=1，是真正的不校验，安全性低于上面的主链接。"
+    warn "只在旧客户端读不懂 pinSHA256 时才用它，能用主链接就别用。"
+    warn "最新版 v2rayN / Xray 不接受这个链接：allowInsecure 已被移除，会直接报错。"
+    yellow "  mihomo 兼容配置     : ${CLIENT_DIR}/clash-meta-compat.yaml"
+    yellow "  sing-box 兼容配置   : ${CLIENT_DIR}/sing-box-compat.json"
+  fi
+  return 0
 }
 
 show_conf() {
@@ -2003,6 +2344,10 @@ show_conf() {
   yellow "客户端文件目录: ${CLIENT_DIR}/"
   yellow "  Clash Meta / mihomo : ${CLIENT_DIR}/clash-meta.yaml"
   yellow "  sing-box outbound   : ${CLIENT_DIR}/sing-box.json"
+  if [[ "$(meta_get xray_out)" == "1" && -f "${CLIENT_DIR}/xray-outbound.json" ]]; then
+    yellow "  Xray outbound       : ${CLIENT_DIR}/xray-outbound.json"
+  fi
+  show_pinned_info
   if [[ -n "$(meta_get bw_up)" ]]; then
     green "拥塞控制: Brutal（上行 $(meta_get bw_up) / 下行 $(meta_get bw_down) Mbps）"
   else

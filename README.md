@@ -1,6 +1,6 @@
 # install-hy2-script
 
-Hysteria 2（hy2）一键安装脚本：交互菜单、多系统支持、自签 / ACME / 自定义证书、端口跳跃、客户端 YAML/JSON/分享链接/二维码。
+Hysteria 2（hy2）一键安装脚本：交互菜单、多系统支持、自签 / ACME / 自定义证书 / 域名正式证书 / SHA-256 证书固定、端口跳跃、客户端 YAML/JSON/sing-box/mihomo/Xray 配置与分享链接二维码。
 
 ## 权限要求（必须 root）✅
 
@@ -51,6 +51,8 @@ sudo bash install-hy2.sh
 | **一键安装** | ✅ | 全默认：自签 `www.bing.com` + 随机端口/密码 + 伪装 bing |
 | 卸载 | ✅ | 官方 [get.hy2.sh](https://get.hy2.sh/) 卸二进制 + 清配置 |
 | 证书（自签 / ACME / 自定义） | ✅ | 默认自签 `www.bing.com`；ACME 需域名 |
+| **域名 + ACME 正式证书（选项4）** | ✅ | 校验解析 + 灰云提示 + 自动续期；`insecure=0`，不生成跳过校验字段 |
+| **自签 + SHA-256 证书固定（选项5）** | ✅ | 私有 CA 签发叶子证书，客户端用指纹真校验；适配已移除 `allowInsecure` 的新版 Xray / v2rayN |
 | 端口 / 端口跳跃 | ✅ | 随机或自定义 UDP；跳跃用 iptables DNAT |
 | 认证密码 | ✅ | 手输或随机 |
 | 伪装站 masquerade | ✅ | 默认 `www.bing.com` |
@@ -109,6 +111,60 @@ sudo bash install-hy2.sh
 0. 返回
 ```
 
+### 证书方式（安装 / 修改证书时的子菜单）
+
+```
+1. 自签证书（默认，SNI=www.bing.com）
+2. ACME 自动申请（需域名解析到本机）
+3. 自定义证书路径
+4. 自有域名 + ACME 正式证书   ← 推荐，最新版 Xray 使用
+5. 自签证书 + SHA-256 证书固定 ← 无域名，最新版 Xray 使用
+```
+
+选项 1~3 行为与旧版完全一致。选项 4 / 5 是为「最新版 Xray 已移除 `allowInsecure`」
+新增的两条路径，两者都能给出**直接粘贴就能用**的链接，端口和证书全程自动处理。
+
+#### 4. 自有域名 + ACME 正式证书（推荐）
+
+- 先校验域名解析是否指向本机公网 IP，不一致时提示并要求确认
+- 明确提示 Cloudflare 等 CDN 必须切 **灰云 / DNS only**：橙云既会让 ACME 失败，
+  也不转发 QUIC，节点必然连不上
+- 申请阶段自动放行 **TCP 80**，结束后立即收回；续期由写进 acme.sh 的
+  pre/post hook 自动开关，无需人工干预
+- 客户端一律 `insecure=false`，**不生成** `allowInsecure`，链接里也**不会**出现 `insecure=1`
+- 产出：Hysteria2 YAML/JSON、sing-box、mihomo、Xray/v2rayN outbound、分享链接与二维码
+
+前置条件：域名已解析到本机、云安全组放行 TCP 80（申请与续期用）与节点 UDP 端口。
+
+#### 5. 自签证书 + SHA-256 证书固定（无域名）
+
+- 创建**私有 CA**（`CA:TRUE`），再由 CA 签发服务器叶子证书（`CA:FALSE`，
+  带 `SAN` 与 `serverAuth`），并自动计算叶子证书的 SHA-256
+- 每种客户端各给一条真校验路径：
+
+  | 客户端 | 用什么校验 |
+  |--------|-----------|
+  | **v2rayN（最新版，Xray 内核）** | 主链接里的 `pinSHA256` → 自动转成 `pinnedPeerCertSha256`，并强制关闭 `allowInsecure` |
+  | Hysteria2 官方 / NekoBox | 链接与配置里的 `pinSHA256`（冒号 hex） |
+  | mihomo / Clash Meta | `clash-meta.yaml` 的 `fingerprint` |
+  | sing-box | `sing-box.json` 内嵌的 CA 证书 |
+  | Xray（手工配置） | `xray-outbound.json` 的 `pinnedPeerCertSha256` |
+
+- 主链接里的 `insecure=1` **不等于不校验**：hysteria 官方客户端设了 `pinSHA256`
+  也不会关掉标准链校验（Go 先验链、验过才调 `VerifyPeerCertificate`），私有 CA
+  必然卡在第一步，所以必须让它跳过公共 CA 信任链，真正的校验交给指纹完成。
+  中间人换一张证书，指纹对不上照样连不上。
+- 兼容产物单独成文件（文件名带 `-compat`），只有 `insecure=1`、没有指纹，
+  是**真正的不校验**，仅供读不懂 `pinSHA256` 的旧客户端；
+  **最新版 v2rayN / Xray 不接受兼容链接**（`allowInsecure` 已被移除，会直接报错）
+- 隐蔽性提醒：自签证书仍可能被主动探测识别，追求最强抗识别请用**选项 4**
+
+> 最新版 Xray-core 已原生支持 Hysteria2（`protocol: hysteria` +
+> `network: hysteria` + `hysteriaSettings`），最新版 v2rayN 正是用 Xray 内核跑
+> hy2 节点，所以 `xray-outbound.json` 是一份可直接放进 `outbounds` 的完整出站。
+> 证书固定字段名为 `pinnedPeerCertSha256`（URI 简写 `pcs`），值是**冒号 hex**
+> 指纹，不是 base64。
+
 ### 防火墙策略
 
 安装或改端口后，脚本会 **自动检测** 本机防火墙并放行 hy2 的 UDP 端口：
@@ -144,11 +200,15 @@ ACME 申请证书时会额外按同一逻辑**临时**放行 **TCP 80**，申请
 | `/etc/hysteria/config.yaml` | 服务端配置（`600`，含明文密码） |
 | `/etc/hysteria/install.meta` | 安装元数据（`600`，含明文密码） |
 | `/etc/hysteria/cert.crt` / `private.key` | 自签证书（默认） |
+| `/etc/hysteria/ca.crt` / `ca.key` | 私有 CA（仅选项 5；`ca.key` 为 `600`） |
 | `/root/hy/` | 客户端目录（`700`，内含密码的文件均为 `600`） |
 | `/root/hy/hy-client.yaml` / `.json` | Hysteria 官方客户端配置 |
 | `/root/hy/clash-meta.yaml` | Clash Meta / mihomo 片段 |
 | `/root/hy/sing-box.json` | sing-box outbound 片段 |
 | `/root/hy/url.txt` / `url-qr.png` | 分享链接与二维码 |
+| `/root/hy/xray-outbound.json` | Xray / v2rayN 的 Hysteria2 outbound（仅选项 4 / 5） |
+| `/root/hy/ca.crt` | 私有 CA 证书，供客户端导入（仅选项 5） |
+| `/root/hy/*-compat.*` / `url-compat.txt` | 兼容产物，`insecure=1`，仅旧客户端用（仅选项 5） |
 | `systemctl status hysteria-server` | 服务状态 |
 
 ## 防火墙 / 安全组
@@ -249,6 +309,18 @@ hysteria2://PASSWORD@SERVER_IP:PORT/?insecure=1&sni=www.bing.com#Hysteria2
 - 端口跳跃时附加 `mport=起始-结束`
 - 启用 Brutal 时附加 `upmbps=10&downmbps=30`（多数客户端可识别）
 
+证书固定（选项 5）的主链接形如：
+
+```text
+hysteria2://PASSWORD@SERVER_IP:PORT/?insecure=1&sni=www.bing.com&pinSHA256=5B:02:...:D6#Hysteria2
+```
+
+- 这里的 `insecure=1` 跳过的只是公共 CA 信任链，`pinSHA256` 才是真正的校验
+- 最新版 v2rayN 读到 `pinSHA256` 会强制 `allowInsecure=false`，链接里的
+  `insecure=1` 会被它覆盖掉
+- 同目录下的 `url-compat.txt` 只有 `insecure=1`、没有指纹，是真正的不校验，
+  **只在旧客户端不认 `pinSHA256` 时才用**
+
 ## 安全说明
 
 - 含明文密码的文件（`config.yaml`、`install.meta`、`/root/hy/*`）一律 `600`，
@@ -273,6 +345,7 @@ bash tests/run.sh
 | `tests/test-firewall-tcp.sh` | ACME 借用 TCP 80 的开关逻辑（ufw / firewalld / iptables / 无防火墙） |
 | `tests/test-update-script.sh` | 自更新的下载校验：CDN 错误页、截断传输、空文件一律拒装 |
 | `tests/test-cli-tty.sh` | 各子命令的 TTY 门禁：只读命令放行、交互命令拦截 |
+| `tests/test-cert-pinning.sh` | 证书选项 4 / 5：CA 与叶子证书扩展、指纹、各客户端产物、兼容产物、选项 1~3 回归 |
 
 `tests/run.sh` 会先跑一次 `bash -n` 语法检查，再依次执行 `tests/test-*.sh`。
 
