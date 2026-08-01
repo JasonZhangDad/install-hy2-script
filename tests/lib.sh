@@ -15,3 +15,9 @@ load_func() {
   local fn="$1"
   eval "$(awk -v f="^${fn}\\\\(\\\\)" '$0 ~ f, /^}/' "$SRC")"
 }
+
+# 整脚本载入（只去掉末尾那行 main 调用），用于多个函数互相调用的集成测试。
+# load_func 抽不出内嵌 JSON 的函数（heredoc 里有顶格的 }），这类只能整份载入。
+load_script_no_main() {
+  eval "$(grep -v '^main "\$@"$' "$SRC")"
+}
