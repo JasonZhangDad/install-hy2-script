@@ -1,5 +1,7 @@
 # install-hy2-script
 
+**简体中文** | [English](README.en.md)
+
 Hysteria 2（hy2）一键安装脚本：交互菜单、多系统支持、自签 / ACME / 自定义证书 / 域名正式证书 / SHA-256 证书固定、端口跳跃、客户端 YAML/JSON/sing-box/mihomo/Xray 配置与分享链接二维码。
 
 ## 权限要求（必须 root）✅
@@ -62,7 +64,7 @@ sudo bash install-hy2.sh
 | **更新 Hysteria** | ✅ | 官方 `--force`，保留配置 |
 | **UDP 缓冲优化** | ✅ | sysctl `rmem/wmem` 等 |
 | **防火墙自动识别** | ✅ | ufw → firewalld → iptables，自动放行 UDP |
-| 客户端输出 | ✅ | `/root/hy/` 下 YAML / JSON / url / 二维码 / Clash Meta / sing-box |
+| 客户端输出 | ✅ | `/root/hy/` 下 YAML / JSON / url / 二维码 / Clash Meta / sing-box / Xray outbound |
 | **连通性自检** | ✅ | 安装后自动跑一次，指出到底哪一层不通 |
 | **查看链接 / 二维码** | ✅ | 断线回来直接看，主菜单第 3 项 |
 | 更新本脚本 | ✅ | 写入 `/usr/local/bin/install-hy2` |
@@ -330,6 +332,9 @@ hysteria2://PASSWORD@SERVER_IP:PORT/?insecure=1&sni=www.bing.com&pinSHA256=5B:02
 - 密码限制为 `A-Za-z0-9._~-`：这些字符在 YAML 和 URL 中均无歧义，
   避免 `: ` 写坏配置、`*` 被当成 YAML alias
 - 脚本下载临时文件一律使用 `mktemp` 随机名，避免 `/tmp` 下的软链抢占
+- 选项 5 的私有 CA 私钥 `/etc/hysteria/ca.key` 固定为 `root:root 600`，
+  **不随 `chown -R` 交给服务运行用户** —— 拿到它就能签出被你的客户端信任的
+  任意证书，而 hysteria 本身只需要叶子证书和叶子私钥
 
 ## 开发 / 测试
 
@@ -352,7 +357,8 @@ bash tests/run.sh
 ## 说明
 
 - 二进制安装来源为 Hysteria 官方脚本 `https://get.hy2.sh/`，不经过第三方改包。
-- 自签仅适合快速部署；有域名时建议使用 ACME。
+- 选项 1 的裸自签仅适合快速部署（客户端完全不校验）；无域名但要真校验用选项 5，
+  有域名一律建议选项 4。
 - ACME 证书续期由 acme.sh 自己的 cron 完成；脚本已在 `--reloadcmd` 中带上
   `chown` / `chmod`，避免续期后证书属主变回 root 导致服务起不来。
 - 卸载不会删除本机其它站点使用的 `acme.sh` 与证书，仅清理本脚本生成的 hy2 相关文件。
