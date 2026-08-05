@@ -300,8 +300,19 @@ ensure_deps() {
   pkg_install curl wget openssl ca-certificates 2>/dev/null || pkg_install curl wget openssl || true
 
   if [[ "$OS_FAMILY" == "debian" ]]; then
-    pkg_install qrencode socat cron iptables iptables-persistent netfilter-persistent 2>/dev/null || \
+    # ⚠️ Debian/Ubuntu 的 ufw 包声明了 Breaks: iptables-persistent, netfilter-persistent，
+    # 二者互斥：装这两个包会让 apt 直接卸载 ufw，连同它的全部放行规则一起静默失效
+    # （实测把一台只放行 Cloudflare 回源的机器变成全站 523，且规则被 save 固化，重启不自愈）。
+    # 故 ufw 正在生效时跳过它们——此时 open_firewall 本就走 ufw 分支，由 ufw 自己持久化。
+    # 判据用 detect_firewall 而非 command -v ufw：Ubuntu 默认预装但不启用 ufw，
+    # 全新机器上 ufw 未启用 → 仍照常装 iptables-persistent，行为与之前完全一致。
+    if [[ "$(detect_firewall)" == "ufw" ]]; then
+      warn "ufw 正在生效，跳过 iptables-persistent/netfilter-persistent（安装它们会导致 apt 卸载 ufw 并清空其规则）"
       pkg_install qrencode socat cron iptables 2>/dev/null || true
+    else
+      pkg_install qrencode socat cron iptables iptables-persistent netfilter-persistent 2>/dev/null || \
+        pkg_install qrencode socat cron iptables 2>/dev/null || true
+    fi
   elif [[ "$OS_FAMILY" == "rhel" ]]; then
     pkg_install qrencode socat cronie iptables iptables-services 2>/dev/null || \
       pkg_install socat cronie iptables 2>/dev/null || true
